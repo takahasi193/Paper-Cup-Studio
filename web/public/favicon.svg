@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <style>
+    .bg { fill: #f6f0e7; }
+    .cup-fill { fill: #fcfaf5; }
+    .cup-ink { stroke: #251c16; }
+    .string { stroke: #cc3719; }
+    .knot { fill: #cc3719; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0b0e14; }
+      .cup-fill { fill: #181c26; }
+      .cup-ink { stroke: #ebe4d8; }
+      .string { stroke: #f5714e; }
+      .knot { fill: #f5714e; }
+    }
+  </style>
+  <rect class="bg" width="32" height="32" rx="7" />
+  <path
+    class="cup-fill cup-ink"
+    d="M5 10.5 7.4 21.5c.2.9 1 1.5 1.9 1.5h3.4c.9 0 1.7-.6 1.9-1.5L17 10.5H5Z"
+    stroke-width="1.6"
+    stroke-linejoin="round"
+  />
+  <path class="cup-ink" d="M4.2 10.5h13.6" stroke-width="1.7" stroke-linecap="round" />
+  <path
+    class="string"
+    d="M11 23c0 3.2 4.5 4.4 9.5 3.6 3.8-.6 6.8-2.6 7.8-6.4"
+    stroke-width="2"
+    stroke-linecap="round"
+  />
+  <circle class="knot" cx="28.4" cy="19.5" r="1.6" />
+</svg>

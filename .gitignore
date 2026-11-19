@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+.mypy_cache/
+
+# Rust / Node leftovers
+/target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+**/build/
+*.tsbuildinfo
+
+# Databases & local project storage
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Environment & credentials
+.env
+.env.*
+!.env.example
+*.env
+*.key
+*.pem
+papercup.toml
+.papercup/
+
+# Optional real VN archives used by tests/agent/vn (never commit)
+tests/agent/vn/samples/*.rpa
+tests/agent/vn/samples/*.xp3
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

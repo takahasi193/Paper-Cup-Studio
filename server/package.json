@@ -1,0 +1,27 @@
+{
+  "name": "papercup-server",
+  "version": "0.1.0-beta.1",
+  "private": true,
+  "type": "module",
+  "description": "Paper Cup agent core server powered by Pi Agent SDK",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^1.5.1",
+    "@earendil-works/pi-ai": "^1.5.1",
+    "@earendil-works/pi-coding-agent": "^1.5.1",
+    "@hono/node-server": "^1.13.8",
+    "@sinclair/typebox": "^0.34.52",
+    "hono": "^4.7.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

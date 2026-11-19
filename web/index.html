@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="text-scale" content="scale" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (function () {
+        try {
+          var scheme = localStorage.getItem('papercup:color-scheme');
+          var meta = document.querySelector('meta[name="color-scheme"]');
+          if (meta && (scheme === 'light' || scheme === 'dark')) {
+            meta.content = scheme;
+          }
+          if (localStorage.getItem('papercup:ambient-motion') === 'off') {
+            document.documentElement.dataset.ambient = 'off';
+          }
+          localStorage.removeItem('papercup:theme');
+        } catch (e) {}
+      })();
+    </script>
+    <title>Paper Cup · 视觉小说本地化</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

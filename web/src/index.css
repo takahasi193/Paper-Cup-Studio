@@ -1,0 +1,1518 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  --color-canvas: var(--canvas);
+  --color-sheet: var(--sheet);
+  --color-surface-raised: var(--surface-raised);
+  --color-well: var(--well);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-string: var(--string);
+  --color-string-ink: var(--string-ink);
+  --color-on-string: var(--on-string);
+  --color-voice: var(--voice);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-field: var(--field);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-stage-border: var(--stage-border);
+  --color-string-soft: var(--string-soft);
+  --color-voice-soft: var(--voice-soft);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger-soft: var(--danger-soft);
+
+  --font-display: "Instrument Serif", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-editorial: "Noto Serif SC", "Noto Serif JP", "Yu Mincho", "Hiragino Mincho ProN",
+    "Songti SC", "Source Han Serif SC", "STSong", Georgia, serif;
+  --font-editorial-jp: "Noto Serif JP", "Yu Mincho", "Hiragino Mincho ProN", "Noto Serif SC",
+    Georgia, serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, "Segoe UI Variable Text", "Segoe UI",
+    "PingFang SC", "Hiragino Sans", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SF Mono", ui-monospace, Consolas, monospace;
+}
+
+/* Progressive gradient color-space interpolation tokens (fallback to empty) */
+:root {
+  --in-oklab: ;
+  --in-oklch: ;
+}
+
+@supports (background: linear-gradient(in oklab, white, black)) {
+  :root {
+    --in-oklab: in oklab;
+    --in-oklch: in oklch;
+  }
+}
+
+/* ============================================================================
+   Root Color System: Light「纸」& Dark「夜」(OKLCH calibrated)
+   ============================================================================ */
+:root {
+  color-scheme: light dark;
+
+  /* Light「纸」palette — warm archival paper mat beneath elevated studio sheet */
+  --canvas-light: oklch(0.946 0.014 82);
+  --sheet-light: oklch(0.986 0.007 85);
+  --surface-raised-light: oklch(0.996 0.004 85);
+  --well-light: oklch(0.932 0.015 80);
+  --ink-light: oklch(0.225 0.018 55);
+  --ink-2-light: oklch(0.425 0.016 60);
+  --ink-3-light: oklch(0.515 0.014 65);
+  --string-light: oklch(0.555 0.195 33);
+  --string-ink-light: oklch(0.495 0.175 32);
+  --on-string-light: oklch(0.99 0.005 85);
+  --voice-light: oklch(0.5 0.16 262);
+  --ok-light: oklch(0.495 0.125 155);
+  --warn-light: oklch(0.53 0.12 68);
+  --danger-light: oklch(0.52 0.19 25);
+  --field-light: oklch(0.58 0.014 65);
+  --specular-light: oklch(1 0 0 / 0.78);
+  --scroll-shadow-light: rgb(28 22 14 / 0.075);
+  --ambient-a-light: oklch(0.84 0.065 42 / 0.18);
+  --ambient-b-light: oklch(0.86 0.045 258 / 0.13);
+  --shadow-stage-light: 0 1px 2px rgb(35 28 18 / 0.04), 0 14px 38px -18px rgb(35 28 18 / 0.12);
+  --shadow-float-light: 0 2px 6px rgb(35 28 18 / 0.05), 0 18px 42px -18px rgb(35 28 18 / 0.18);
+  --shadow-card-light: 0 1px 2px rgb(35 28 18 / 0.04), 0 8px 22px -14px rgb(35 28 18 / 0.12);
+
+  /* Dark「夜」palette — deep indigo ink mat beneath tactile charcoal-indigo sheet */
+  --canvas-dark: oklch(0.135 0.014 262);
+  --sheet-dark: oklch(0.188 0.015 262);
+  --surface-raised-dark: oklch(0.232 0.017 262);
+  --well-dark: oklch(0.228 0.016 262);
+  --ink-dark: oklch(0.94 0.01 85);
+  --ink-2-dark: oklch(0.795 0.012 85);
+  --ink-3-dark: oklch(0.67 0.012 85);
+  --string-dark: oklch(0.705 0.175 36);
+  --string-ink-dark: oklch(0.765 0.145 38);
+  --on-string-dark: oklch(0.16 0.02 30);
+  --voice-dark: oklch(0.75 0.115 262);
+  --ok-dark: oklch(0.76 0.13 158);
+  --warn-dark: oklch(0.8 0.13 80);
+  --danger-dark: oklch(0.72 0.16 25);
+  --field-dark: oklch(0.5 0.014 262);
+  --specular-dark: oklch(1 0 0 / 0.065);
+  --scroll-shadow-dark: rgb(0 0 0 / 0.34);
+  --ambient-a-dark: oklch(0.45 0.11 36 / 0.14);
+  --ambient-b-dark: oklch(0.42 0.09 262 / 0.16);
+  --shadow-stage-dark: 0 1px 2px rgb(0 0 0 / 0.28), 0 20px 46px -18px rgb(0 0 0 / 0.56);
+  --shadow-float-dark: 0 4px 12px rgb(0 0 0 / 0.3), 0 22px 48px -16px rgb(0 0 0 / 0.62);
+  --shadow-card-dark: 0 1px 3px rgb(0 0 0 / 0.24), 0 10px 26px -14px rgb(0 0 0 / 0.45);
+
+  /* Fallback tokens when light-dark() is unsupported */
+  --canvas: var(--canvas-light);
+  --sheet: var(--sheet-light);
+  --surface-raised: var(--surface-raised-light);
+  --well: var(--well-light);
+  --ink: var(--ink-light);
+  --ink-2: var(--ink-2-light);
+  --ink-3: var(--ink-3-light);
+  --string: var(--string-light);
+  --string-ink: var(--string-ink-light);
+  --on-string: var(--on-string-light);
+  --voice: var(--voice-light);
+  --ok: var(--ok-light);
+  --warn: var(--warn-light);
+  --danger: var(--danger-light);
+  --field: var(--field-light);
+  --specular: var(--specular-light);
+  --scroll-shadow: var(--scroll-shadow-light);
+  --ambient-a: var(--ambient-a-light);
+  --ambient-b: var(--ambient-b-light);
+  --shadow-stage: var(--shadow-stage-light);
+  --shadow-float: var(--shadow-float-light);
+  --shadow-card: var(--shadow-card-light);
+
+  @media (prefers-color-scheme: dark) {
+    --canvas: var(--canvas-dark);
+    --sheet: var(--sheet-dark);
+    --surface-raised: var(--surface-raised-dark);
+    --well: var(--well-dark);
+    --ink: var(--ink-dark);
+    --ink-2: var(--ink-2-dark);
+    --ink-3: var(--ink-3-dark);
+    --string: var(--string-dark);
+    --string-ink: var(--string-ink-dark);
+    --on-string: var(--on-string-dark);
+    --voice: var(--voice-dark);
+    --ok: var(--ok-dark);
+    --warn: var(--warn-dark);
+    --danger: var(--danger-dark);
+    --field: var(--field-dark);
+    --specular: var(--specular-dark);
+    --scroll-shadow: var(--scroll-shadow-dark);
+    --ambient-a: var(--ambient-a-dark);
+    --ambient-b: var(--ambient-b-dark);
+    --shadow-stage: var(--shadow-stage-dark);
+    --shadow-float: var(--shadow-float-dark);
+    --shadow-card: var(--shadow-card-dark);
+  }
+
+  /* Meta-driven override via :has() — zero JS class dependency */
+  &:has(> head > meta[name="color-scheme"][content="dark"]) {
+    color-scheme: dark;
+    --canvas: var(--canvas-dark);
+    --sheet: var(--sheet-dark);
+    --surface-raised: var(--surface-raised-dark);
+    --well: var(--well-dark);
+    --ink: var(--ink-dark);
+    --ink-2: var(--ink-2-dark);
+    --ink-3: var(--ink-3-dark);
+    --string: var(--string-dark);
+    --string-ink: var(--string-ink-dark);
+    --on-string: var(--on-string-dark);
+    --voice: var(--voice-dark);
+    --ok: var(--ok-dark);
+    --warn: var(--warn-dark);
+    --danger: var(--danger-dark);
+    --field: var(--field-dark);
+    --specular: var(--specular-dark);
+    --scroll-shadow: var(--scroll-shadow-dark);
+    --ambient-a: var(--ambient-a-dark);
+    --ambient-b: var(--ambient-b-dark);
+    --shadow-stage: var(--shadow-stage-dark);
+    --shadow-float: var(--shadow-float-dark);
+    --shadow-card: var(--shadow-card-dark);
+  }
+
+  &:has(> head > meta[name="color-scheme"][content="light"]) {
+    color-scheme: light;
+    --canvas: var(--canvas-light);
+    --sheet: var(--sheet-light);
+    --surface-raised: var(--surface-raised-light);
+    --well: var(--well-light);
+    --ink: var(--ink-light);
+    --ink-2: var(--ink-2-light);
+    --ink-3: var(--ink-3-light);
+    --string: var(--string-light);
+    --string-ink: var(--string-ink-light);
+    --on-string: var(--on-string-light);
+    --voice: var(--voice-light);
+    --ok: var(--ok-light);
+    --warn: var(--warn-light);
+    --danger: var(--danger-light);
+    --field: var(--field-light);
+    --specular: var(--specular-light);
+    --scroll-shadow: var(--scroll-shadow-light);
+    --ambient-a: var(--ambient-a-light);
+    --ambient-b: var(--ambient-b-light);
+    --shadow-stage: var(--shadow-stage-light);
+    --shadow-float: var(--shadow-float-light);
+    --shadow-card: var(--shadow-card-light);
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --canvas: light-dark(var(--canvas-light), var(--canvas-dark));
+    --sheet: light-dark(var(--sheet-light), var(--sheet-dark));
+    --surface-raised: light-dark(var(--surface-raised-light), var(--surface-raised-dark));
+    --well: light-dark(var(--well-light), var(--well-dark));
+    --ink: light-dark(var(--ink-light), var(--ink-dark));
+    --ink-2: light-dark(var(--ink-2-light), var(--ink-2-dark));
+    --ink-3: light-dark(var(--ink-3-light), var(--ink-3-dark));
+    --string: light-dark(var(--string-light), var(--string-dark));
+    --string-ink: light-dark(var(--string-ink-light), var(--string-ink-dark));
+    --on-string: light-dark(var(--on-string-light), var(--on-string-dark));
+    --voice: light-dark(var(--voice-light), var(--voice-dark));
+    --ok: light-dark(var(--ok-light), var(--ok-dark));
+    --warn: light-dark(var(--warn-light), var(--warn-dark));
+    --danger: light-dark(var(--danger-light), var(--danger-dark));
+    --field: light-dark(var(--field-light), var(--field-dark));
+    --specular: light-dark(var(--specular-light), var(--specular-dark));
+    --scroll-shadow: light-dark(var(--scroll-shadow-light), var(--scroll-shadow-dark));
+    --ambient-a: light-dark(var(--ambient-a-light), var(--ambient-a-dark));
+    --ambient-b: light-dark(var(--ambient-b-light), var(--ambient-b-dark));
+    --shadow-stage: light-dark(var(--shadow-stage-light), var(--shadow-stage-dark));
+    --shadow-float: light-dark(var(--shadow-float-light), var(--shadow-float-dark));
+    --shadow-card: light-dark(var(--shadow-card-light), var(--shadow-card-dark));
+  }
+
+  /* Derived tokens */
+  --line: color-mix(in oklab, var(--ink) 11%, transparent);
+  --line-strong: color-mix(in oklab, var(--ink) 20%, transparent);
+  --stage-border: color-mix(in oklab, var(--ink) 13%, transparent);
+  --string-soft: color-mix(in oklab, var(--string) 11%, transparent);
+  --voice-soft: color-mix(in oklab, var(--voice) 11%, transparent);
+  --ok-soft: color-mix(in oklab, var(--ok) 11%, transparent);
+  --warn-soft: color-mix(in oklab, var(--warn) 12%, transparent);
+  --danger-soft: color-mix(in oklab, var(--danger) 11%, transparent);
+  --scrollbar-thumb: color-mix(in oklab, var(--ink) 40%, transparent);
+  --scrollbar-track: transparent;
+
+  /* Motion curves: keyword fallback + physics linear() */
+  --ease-settle: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  @supports (animation-timing-function: linear(0, 1)) {
+    --ease-settle: linear(0, 0.012 0.9%, 0.05 2%, 0.411 9.2%, 0.517 11.8%, 0.611 14.6%, 0.694 17.7%, 0.765 21.1%, 0.824 24.8%, 0.872 28.9%, 0.91 33.4%, 0.939 38.4%, 0.977 50.9%, 0.994 68.4%, 1);
+    --ease-spring: linear(0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.723 12.9%, 0.938 17.7%, 1.017 20.6%, 1.051 23.6%, 1.055 25.4%, 1.051 27.6%, 1.007 37.8%, 0.995 44.3%, 0.995 52%, 1.001 70%, 1);
+  }
+
+  /* Touch target sizing (WCAG 2.5.8 / 2.5.5) */
+  --target-size: 24px;
+  @media (pointer: coarse) {
+    --target-size: 44px;
+  }
+
+  /* Fallback display scaling if font-size-adjust: from-font is absent */
+  --display-scale: 1;
+  @supports not (font-size-adjust: from-font) {
+    --display-scale: 0.94;
+  }
+
+  accent-color: var(--string);
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+
+  @media (forced-colors: active) {
+    --canvas: Canvas;
+    --sheet: Canvas;
+    --surface-raised: Canvas;
+    --well: Canvas;
+    --ink: CanvasText;
+    --ink-2: CanvasText;
+    --ink-3: GrayText;
+    --string: Highlight;
+    --string-ink: Highlight;
+    --on-string: HighlightText;
+    --voice: Highlight;
+    --ok: CanvasText;
+    --warn: CanvasText;
+    --danger: CanvasText;
+    --field: CanvasText;
+    --line: CanvasText;
+    --line-strong: CanvasText;
+    --stage-border: CanvasText;
+    --specular: transparent;
+    --scroll-shadow: transparent;
+    --shadow-stage: none;
+    --shadow-float: none;
+    --shadow-card: none;
+    --string-soft: Canvas;
+    --voice-soft: Canvas;
+    --ok-soft: Canvas;
+    --warn-soft: Canvas;
+    --danger-soft: Canvas;
+  }
+}
+
+/* ============================================================================
+   Base Layer
+   ============================================================================ */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    overflow: hidden;
+    background-color: var(--canvas);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :lang(ja) {
+    font-family: ui-sans-serif, system-ui, "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+      "Yu Gothic UI", "Meiryo", "Noto Sans JP", sans-serif;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p,
+  li {
+    text-wrap: pretty;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklab, var(--string) 26%, transparent);
+    color: var(--ink);
+  }
+
+  :where(button, select, input:not([type="checkbox"], [type="radio"]), label:has(input[type="checkbox"], input[type="radio"])) {
+    min-block-size: var(--target-size);
+  }
+
+  :where(button, select, input:not([type="checkbox"], [type="radio"]), label:has(input[type="checkbox"], input[type="radio"])) {
+    min-inline-size: var(--target-size);
+  }
+
+  :where(button, a[href], select, input, textarea, summary, [tabindex="0"]):focus-visible {
+    outline: 2px solid var(--string-ink);
+    outline-offset: 2px;
+
+    @media (forced-colors: active) {
+      outline-color: Highlight;
+    }
+  }
+
+  :where(button:not(:disabled)):active {
+    @media (prefers-reduced-motion: no-preference) {
+      scale: 0.97;
+    }
+  }
+}
+
+/* ============================================================================
+   Utilities & Accessibility Helpers
+   ============================================================================ */
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* ============================================================================
+   Component Layer
+   ============================================================================ */
+@layer components {
+  /* Display Serif Typography */
+  .pc-display {
+    font-family: var(--font-display);
+    font-size-adjust: from-font;
+    letter-spacing: -0.015em;
+  }
+
+  @supports not (font-size-adjust: from-font) {
+    .pc-display {
+      font-size: calc(1em * var(--display-scale));
+    }
+  }
+
+  /* Japanese / Editorial Mincho Typography */
+  .pc-editorial-title {
+    font-family: var(--font-editorial);
+    font-weight: 500;
+    letter-spacing: 0.055em;
+    line-height: 1.38;
+    text-wrap: balance;
+    font-size-adjust: from-font;
+  }
+
+  .pc-editorial-jp {
+    font-family: var(--font-editorial-jp);
+    font-weight: 500;
+    letter-spacing: 0.045em;
+    font-size-adjust: from-font;
+  }
+
+  @supports not (font-size-adjust: from-font) {
+    .pc-editorial-title {
+      line-height: 1.42;
+      font-size: clamp(1.375rem, 1rem + 1.35vw, 1.98rem);
+    }
+    .pc-editorial-jp {
+      line-height: 1.45;
+    }
+  }
+
+  /* Ambient Atmospheric Studio Backdrop */
+  .pc-studio-ambient {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(65% 48% at 22% 8% var(--in-oklab), var(--ambient-a), transparent 72%),
+      radial-gradient(58% 44% at 86% 86% var(--in-oklab), var(--ambient-b), transparent 72%);
+
+    @media (forced-colors: active) {
+      display: none;
+    }
+  }
+
+  /* Elevated Floating Studio Surface (Stage & Inspector Rail) */
+  .pc-stage-frame {
+    background-color: var(--sheet);
+    box-shadow: inset 0 1px 0 var(--specular), var(--shadow-stage);
+
+    @media (min-width: 64rem) {
+      border: 1px solid var(--stage-border);
+    }
+  }
+
+  /* Paper Grain Texture (SVG feTurbulence mapped to alpha mask) */
+  .pc-paper-grain {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-color: var(--ink);
+    opacity: 0.028;
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='220' height='220'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.75 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    mask-repeat: repeat;
+    mask-size: 220px 220px;
+
+    @media (prefers-color-scheme: dark) {
+      opacity: 0.022;
+    }
+
+    @media (forced-colors: active) {
+      display: none;
+    }
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="dark"]) .pc-paper-grain {
+    opacity: 0.022;
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="light"]) .pc-paper-grain {
+    opacity: 0.028;
+  }
+
+  /* Scrollbar Styling */
+  .pc-scroller {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    scrollbar-width: auto;
+  }
+
+  @supports not (scrollbar-color: auto) {
+    .pc-scroller::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    .pc-scroller::-webkit-scrollbar-track {
+      background: var(--scrollbar-track);
+    }
+    .pc-scroller::-webkit-scrollbar-thumb {
+      background: var(--scrollbar-thumb);
+      border: 2px solid transparent;
+      border-radius: 999px;
+      background-clip: content-box;
+    }
+  }
+
+  /* Scroll-State Aware Stage Scroller: Top Shadow + "Back to Bottom" Button */
+  .pc-stage-scroll {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+
+    @supports (container-type: scroll-state) {
+      container-type: scroll-state;
+    }
+  }
+
+  .pc-stage-scroll::before {
+    content: "";
+    display: block;
+    position: sticky;
+    inset-block-start: 0;
+    block-size: 0.875rem;
+    margin-block-end: -0.875rem;
+    z-index: 15;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 180ms ease;
+    background: radial-gradient(farthest-side at 50% 0, var(--scroll-shadow), transparent);
+  }
+
+  @supports (container-type: scroll-state) {
+    @container scroll-state(scrollable: block-start) {
+      .pc-stage-scroll::before {
+        opacity: 1;
+      }
+    }
+  }
+
+  @supports (not (container-type: scroll-state)) and (animation-timeline: scroll()) {
+    .pc-stage-scroll::before {
+      animation: pc-show-scroll-shadow linear both;
+      animation-timeline: scroll();
+      animation-range: 0 2rem;
+    }
+  }
+
+  @keyframes pc-show-scroll-shadow {
+    to {
+      opacity: 1;
+    }
+  }
+
+  .pc-scroll-bottom-wrap {
+    position: sticky;
+    inset-block-end: 0.875rem;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 20;
+    margin-block-start: -2.75rem;
+  }
+
+  .pc-scroll-bottom {
+    pointer-events: auto;
+    visibility: hidden;
+    opacity: 0;
+    translate: 0 10px;
+    transition:
+      visibility 0.2s,
+      opacity 0.2s ease-out,
+      translate 0.25s var(--ease-settle);
+
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 0.1s;
+      translate: 0 0;
+    }
+  }
+
+  @supports (container-type: scroll-state) {
+    @container scroll-state(scrollable: bottom) {
+      .pc-scroll-bottom {
+        visibility: visible;
+        opacity: 1;
+        translate: 0 0;
+      }
+    }
+  }
+
+  @supports not (container-type: scroll-state) {
+    .pc-stage-scroll[data-scrolled-up="true"] .pc-scroll-bottom {
+      visibility: visible;
+      opacity: 1;
+      translate: 0 0;
+    }
+  }
+
+  /* Soft Translucent Mist Scrim under Floating Composer */
+  .pc-composer-scrim {
+    background: linear-gradient(
+      to top var(--in-oklab),
+      var(--sheet) 52%,
+      color-mix(in oklab, var(--sheet) 88%, transparent) 78%,
+      transparent 100%
+    );
+  }
+
+  /* Interactive Bento Prompt Cards */
+  .pc-hero-card {
+    position: relative;
+    overflow: hidden;
+    background-color: var(--surface-raised);
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow-card);
+    transition:
+      border-color 180ms ease,
+      box-shadow 220ms ease,
+      translate 220ms var(--ease-settle);
+  }
+
+  .pc-hero-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    background: radial-gradient(
+      240px circle at var(--mx, 50%) var(--my, 50%) var(--in-oklab),
+      color-mix(in oklab, var(--string) 11%, transparent),
+      transparent 72%
+    );
+    transition: opacity 220ms ease;
+
+    @media (forced-colors: active) {
+      display: none;
+    }
+  }
+
+  .pc-hero-card:hover,
+  .pc-hero-card:focus-within {
+    border-color: color-mix(in oklab, var(--string) 42%, var(--line-strong));
+    box-shadow: var(--shadow-float);
+  }
+
+  .pc-hero-card:hover {
+    @media (prefers-reduced-motion: no-preference) {
+      translate: 0 -2px;
+    }
+  }
+
+  .pc-hero-card:hover::before,
+  .pc-hero-card:focus-within::before {
+    @media (prefers-reduced-motion: no-preference) {
+      opacity: 1;
+    }
+  }
+
+  .pc-hero-card:active {
+    @media (prefers-reduced-motion: no-preference) {
+      translate: 0 0;
+      scale: 0.985;
+    }
+  }
+
+  /* CSS Conic-Gradient Circular Telemetry Meter (paired with accessible text) */
+  .pc-ring-meter {
+    --p: 0%;
+    position: relative;
+    display: grid;
+    place-items: center;
+    inline-size: 3.5rem;
+    block-size: 3.5rem;
+    border-radius: 50%;
+    flex: none;
+    background: conic-gradient(var(--ok) var(--p), color-mix(in oklab, var(--ink) 12%, transparent) 0%);
+  }
+
+  .pc-ring-meter::before {
+    content: "";
+    position: absolute;
+    inset: 5px;
+    border-radius: 50%;
+    background-color: var(--sheet);
+    border: 1px solid var(--line);
+  }
+
+  @media (forced-colors: active) {
+    .pc-ring-meter {
+      background: Canvas;
+      border: 2px solid CanvasText;
+    }
+  }
+
+  /* Keyboard Shortcut Keycap */
+  .pc-kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-inline-size: 1.25rem;
+    padding: 0.0625rem 0.35rem;
+    border: 1px solid var(--line-strong);
+    border-bottom-width: 2px;
+    border-radius: 0.375rem;
+    background-color: var(--sheet);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    line-height: 1.35;
+    color: var(--ink-2);
+  }
+
+  /* Atelier Paper-Cup Drop Shadow & Halo */
+  .pc-cup-halo {
+    background: radial-gradient(closest-side var(--in-oklab), var(--string-soft), transparent 76%);
+  }
+
+  .pc-cup-art-light,
+  .pc-cup-art-dark {
+    filter: drop-shadow(0 16px 26px rgb(35 28 18 / 0.1));
+  }
+
+  /* Hover/Focus/Touch Action Reveal */
+  .pc-reveal-action {
+    opacity: 0;
+    transition: opacity 150ms ease;
+
+    @media (hover: none) {
+      opacity: 1;
+    }
+  }
+
+  .pc-reveal-row:hover .pc-reveal-action,
+  .pc-reveal-row:focus-within .pc-reveal-action {
+    opacity: 1;
+  }
+
+  /* Auto-expanding Textarea */
+  .pc-textarea {
+    field-sizing: content;
+    width: 100%;
+    min-block-size: 2.75rem;
+    max-block-size: 13rem;
+    resize: none;
+  }
+
+  /* Composer Busy String Pulse Track (motion driven by GSAP) */
+  .pc-string-pulse {
+    position: relative;
+    height: 2px;
+    overflow: hidden;
+    background: color-mix(in oklab, var(--string) 18%, transparent);
+  }
+
+  .pc-string-pulse-bar {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: 38%;
+    background: linear-gradient(90deg, transparent, var(--string), transparent);
+  }
+
+  /* Streaming Chunks (high-frequency token fade) & GSAP Cursor */
+  .pc-stream-chunk {
+    display: inline;
+    transition: opacity 180ms ease-out;
+
+    @starting-style {
+      opacity: 0;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 0.1s;
+    }
+  }
+
+  .pc-stream-cursor {
+    display: inline-block;
+    inline-size: 2px;
+    block-size: 1.05em;
+    margin-inline-start: 2px;
+    border-radius: 999px;
+    background-color: var(--string);
+    vertical-align: text-bottom;
+  }
+
+  /* Status Pill Dot (ripple ring driven by GSAP) */
+  .pc-status-dot {
+    position: relative;
+    display: inline-block;
+    inline-size: 0.5rem;
+    block-size: 0.5rem;
+    border-radius: 50%;
+    flex: none;
+  }
+
+  /* Theme-aware Watercolor Paper Cup Illustration Variants */
+  .pc-cup-art-light {
+    display: block;
+  }
+
+  .pc-cup-art-dark {
+    display: none;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .pc-cup-art-light {
+      display: none;
+    }
+    .pc-cup-art-dark {
+      display: block;
+    }
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="dark"]) .pc-cup-art-light {
+    display: none;
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="dark"]) .pc-cup-art-dark {
+    display: block;
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="light"]) .pc-cup-art-light {
+    display: block;
+  }
+
+  :root:has(> head > meta[name="color-scheme"][content="light"]) .pc-cup-art-dark {
+    display: none;
+  }
+
+  /* Native Modal <dialog> Top-Layer (entry/exit animated via GSAP) */
+  .pc-dialog {
+    --dialog-backdrop: 0;
+    margin: auto;
+    padding: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: 1.25rem;
+    background-color: var(--surface-raised);
+    color: var(--ink);
+    box-shadow: inset 0 1px 0 var(--specular), 0 28px 72px -18px rgb(0 0 0 / 0.38);
+    max-block-size: min(88dvh, 46rem);
+    max-inline-size: min(92dvw, var(--dialog-max-w, 35rem));
+    inline-size: 100%;
+    overscroll-behavior: contain;
+
+    &::backdrop {
+      overflow: hidden;
+      overscroll-behavior: contain;
+      background-color: rgb(0 0 0 / calc(var(--dialog-backdrop, 0) * 0.48));
+      backdrop-filter: blur(calc(var(--dialog-backdrop, 0) * 6px));
+    }
+  }
+
+  /* Scroll-Snap Navigation Drawer (<dialog>) */
+  .pc-drawer {
+    --drawer-width: min(20em, 80dvw, 100dvw - 24px);
+    --drawer-backdrop: 0;
+    inset: 0;
+    width: auto;
+    height: auto;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    overflow: visible;
+    overscroll-behavior: contain;
+  }
+
+  .pc-drawer::backdrop {
+    background: oklch(0.08 0.01 260);
+    opacity: calc(var(--drawer-backdrop) * 0.48);
+    overflow: hidden;
+    overscroll-behavior: contain;
+  }
+
+  .pc-drawer-scroller {
+    position: relative;
+    display: grid;
+    overflow-x: scroll;
+    overscroll-behavior: none;
+    scrollbar-width: none;
+    scroll-snap-type: x mandatory;
+
+    @media (prefers-reduced-motion: no-preference) {
+      scroll-behavior: smooth;
+    }
+  }
+
+  .pc-drawer-scroller::-webkit-scrollbar {
+    display: none;
+  }
+
+  .pc-drawer[data-side="start"] .pc-drawer-scroller {
+    grid-template-columns: var(--drawer-width) 100%;
+  }
+
+  .pc-drawer[data-side="start"] .pc-drawer-scroller::after {
+    content: "";
+    scroll-snap-align: end;
+    scroll-initial-target: nearest;
+  }
+
+  .pc-drawer[data-side="end"] .pc-drawer-scroller {
+    grid-template-columns: 100% var(--drawer-width);
+  }
+
+  .pc-drawer[data-side="end"] .pc-drawer-scroller::before {
+    content: "";
+    scroll-snap-align: start;
+    scroll-initial-target: nearest;
+  }
+
+  .pc-drawer-sheet {
+    display: flex;
+    flex-direction: column;
+    height: 100svh;
+    background-color: var(--sheet);
+    color: var(--ink);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    box-shadow: 0 24px 64px -16px rgb(0 0 0 / 0.36);
+  }
+
+  .pc-drawer[data-side="start"] .pc-drawer-sheet {
+    scroll-snap-align: start;
+    border-inline-end: 1px solid var(--line);
+  }
+
+  .pc-drawer[data-side="end"] .pc-drawer-sheet {
+    scroll-snap-align: end;
+    border-inline-start: 1px solid var(--line);
+  }
+
+  @supports (animation-timeline: scroll()) {
+    .pc-drawer {
+      timeline-scope: --drawer-fade;
+    }
+    .pc-drawer-scroller {
+      scroll-timeline: --drawer-fade x;
+    }
+    .pc-drawer[data-side="start"] {
+      animation: pc-drawer-fade-start linear both;
+      animation-timeline: --drawer-fade;
+    }
+    .pc-drawer[data-side="end"] {
+      animation: pc-drawer-fade-end linear both;
+      animation-timeline: --drawer-fade;
+    }
+  }
+
+  @keyframes pc-drawer-fade-start {
+    0% {
+      --drawer-backdrop: 1;
+    }
+    100% {
+      --drawer-backdrop: 0;
+    }
+  }
+
+  @keyframes pc-drawer-fade-end {
+    0% {
+      --drawer-backdrop: 0;
+    }
+    100% {
+      --drawer-backdrop: 1;
+    }
+  }
+
+  /* <details> Accordion (height & chevron animated via GSAP) */
+  .pc-details > summary {
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .pc-details > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  /* Branded <select> with Native Fallback */
+  .pc-select {
+    color: var(--ink);
+    background-color: transparent;
+  }
+
+  .pc-select option {
+    background-color: var(--sheet);
+    color: var(--ink);
+  }
+
+  @supports (appearance: base-select) {
+    .pc-select,
+    .pc-select::picker(select) {
+      appearance: base-select;
+    }
+
+    .pc-select {
+      align-items: center;
+      gap: 0.375rem;
+    }
+
+    .pc-select::picker(select) {
+      margin-block: 0.375rem;
+      border: 1px solid var(--line-strong);
+      border-radius: 0.75rem;
+      background-color: var(--sheet);
+      padding: 0.25rem;
+      color: var(--ink);
+      box-shadow: 0 18px 44px -12px rgb(0 0 0 / 0.28);
+    }
+
+    .pc-select::picker-icon {
+      color: var(--ink-3);
+      transition: rotate 150ms ease;
+    }
+
+    .pc-select:open::picker-icon {
+      rotate: 180deg;
+    }
+
+    .pc-select option {
+      border-radius: 0.5rem;
+      padding: 0.375rem 0.625rem;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .pc-select option:hover,
+    .pc-select option:focus-visible {
+      background-color: var(--well);
+    }
+
+    .pc-select option::checkmark {
+      color: var(--string);
+      font-weight: 600;
+    }
+  }
+
+  /* Indeterminate <progress> Spinner */
+  progress.pc-spinner {
+    appearance: none;
+    flex: none;
+    inline-size: 0.875rem;
+    block-size: 0.875rem;
+    border-radius: 50%;
+    background: none;
+    border: 2px solid color-mix(in oklab, currentColor 24%, transparent);
+    border-block-start-color: currentColor;
+    animation: pc-spin 0.8s linear infinite;
+
+    @media (prefers-reduced-motion: reduce) {
+      animation-duration: 4s;
+    }
+
+    @media (forced-colors: active) {
+      forced-color-adjust: none;
+      border-color: Canvas;
+      border-block-start-color: CanvasText;
+    }
+  }
+
+  progress.pc-spinner:indeterminate::-webkit-progress-bar,
+  progress.pc-spinner:indeterminate::-webkit-progress-value {
+    display: none;
+    background: none;
+  }
+
+  progress.pc-spinner:indeterminate::-moz-progress-bar {
+    display: none;
+    background: none;
+  }
+
+  @keyframes pc-spin {
+    to {
+      rotate: 1turn;
+    }
+  }
+
+  /* Custom Determinate/Indeterminate <progress> Bar */
+  progress.pc-progress {
+    appearance: none;
+    border: 0 solid;
+    overflow: clip;
+    display: block;
+    inline-size: 100%;
+    block-size: 0.375rem;
+    border-radius: 1e5px;
+    background: var(--line);
+    container-type: inline-size;
+    --progress-bar-fill: var(--ok);
+    --progress-bar-indeterminate-size: 30%;
+    --progress-bar-indeterminate-animation-duration: 1.5s;
+
+    @media (prefers-reduced-motion: reduce) {
+      --progress-bar-indeterminate-animation-duration: 10s;
+    }
+  }
+
+  progress.pc-progress:indeterminate {
+    --progress-bar-animation: pc-progress-indeterminate
+      var(--progress-bar-indeterminate-animation-duration) infinite linear;
+  }
+
+  progress.pc-progress:dir(rtl):indeterminate {
+    --progress-bar-animation: pc-progress-indeterminate
+      var(--progress-bar-indeterminate-animation-duration) infinite linear reverse;
+  }
+
+  progress.pc-progress::-webkit-progress-bar {
+    background: transparent;
+  }
+
+  progress.pc-progress::-webkit-progress-value {
+    background: var(--progress-bar-fill);
+    border-radius: 1e5px;
+    transition: inline-size 0.3s ease;
+    animation: var(--progress-bar-animation, revert-rule);
+  }
+
+  progress.pc-progress::-moz-progress-bar {
+    background: var(--progress-bar-fill);
+    border-radius: 1e5px;
+    transition: inline-size 0.3s ease;
+    animation: var(--progress-bar-animation, revert-rule);
+  }
+
+  @keyframes pc-progress-indeterminate {
+    from,
+    to {
+      inline-size: var(--progress-bar-indeterminate-size);
+      margin-right: auto;
+    }
+    from {
+      translate: -100%;
+    }
+    to {
+      translate: 100cqi;
+    }
+  }
+
+  /* Radio Option Cards */
+  .pc-radio-card {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-block-size: 44px;
+    padding: 0.625rem 0.75rem;
+    border-radius: 0.75rem;
+    border: 1px solid var(--line);
+    background-color: var(--canvas);
+    cursor: pointer;
+    transition: border-color 150ms ease, background-color 150ms ease;
+  }
+
+  .pc-radio-card:hover {
+    border-color: var(--line-strong);
+  }
+
+  .pc-radio-card:has(:checked) {
+    border-color: var(--string);
+    background-color: var(--string-soft);
+  }
+
+  .pc-checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.625rem;
+    min-block-size: 44px;
+    cursor: pointer;
+  }
+
+  /* Ticket Divider Perforation */
+  .pc-ticket-divider {
+    border-block-start: 1px dashed var(--line-strong);
+  }
+
+  /* GFM Markdown Prose inside Chat & Subagent View */
+  .pc-markdown {
+    color: var(--ink);
+    font-size: 0.9375rem;
+    line-height: 1.72;
+    overflow-wrap: break-word;
+  }
+
+  .pc-markdown > :first-child {
+    margin-block-start: 0;
+  }
+
+  .pc-markdown > :last-child {
+    margin-block-end: 0;
+  }
+
+  .pc-markdown p {
+    margin-block: 0.625em;
+  }
+
+  .pc-markdown h1,
+  .pc-markdown h2,
+  .pc-markdown h3,
+  .pc-markdown h4 {
+    color: var(--ink);
+    font-weight: 650;
+    line-height: 1.35;
+    margin-block-start: 1.25em;
+    margin-block-end: 0.5em;
+  }
+
+  .pc-markdown h1 {
+    font-size: 1.25rem;
+    border-block-end: 1px solid var(--line);
+    padding-block-end: 0.3em;
+  }
+
+  .pc-markdown h2 {
+    font-size: 1.125rem;
+    border-block-end: 1px solid var(--line);
+    padding-block-end: 0.25em;
+  }
+
+  .pc-markdown h3 {
+    font-size: 1rem;
+  }
+
+  .pc-markdown h4 {
+    font-size: 0.9375rem;
+  }
+
+  .pc-markdown ul,
+  .pc-markdown ol {
+    margin-block: 0.625em;
+    padding-inline-start: 1.5rem;
+  }
+
+  .pc-markdown ul {
+    list-style-type: disc;
+  }
+
+  .pc-markdown ol {
+    list-style-type: decimal;
+  }
+
+  .pc-markdown li {
+    margin-block: 0.25em;
+  }
+
+  .pc-markdown li > ul,
+  .pc-markdown li > ol {
+    margin-block: 0.25em;
+  }
+
+  .pc-markdown input[type="checkbox"] {
+    margin-inline-end: 0.45rem;
+    vertical-align: middle;
+    accent-color: var(--string);
+  }
+
+  .pc-markdown blockquote {
+    margin-block: 0.75em;
+    margin-inline: 0;
+    border-inline-start: 3px solid var(--string);
+    background-color: color-mix(in oklab, var(--well) 55%, transparent);
+    border-radius: 0 0.5rem 0.5rem 0;
+    padding: 0.5rem 0.875rem;
+    color: var(--ink-2);
+  }
+
+  .pc-markdown blockquote > :first-child {
+    margin-block-start: 0;
+  }
+
+  .pc-markdown blockquote > :last-child {
+    margin-block-end: 0;
+  }
+
+  .pc-markdown hr {
+    margin-block: 1.125rem;
+    border: 0;
+    border-block-start: 1px dashed var(--line-strong);
+  }
+
+  .pc-markdown a {
+    color: var(--string-ink);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+    transition: text-decoration-thickness 140ms ease, opacity 140ms ease;
+  }
+
+  .pc-markdown a:hover {
+    text-decoration-thickness: 2px;
+    opacity: 0.9;
+  }
+
+  .pc-markdown strong {
+    font-weight: 650;
+    color: var(--ink);
+  }
+
+  .pc-markdown :not(pre) > code {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    border: 1px solid var(--line);
+    border-radius: 0.4rem;
+    background-color: var(--well);
+    padding: 0.12em 0.42em;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+
+  /* Code Blocks & Accessible Copy Button */
+  .pc-md-codeblock {
+    margin-block: 0.85em;
+    overflow: hidden;
+    border: 1px solid var(--line-strong);
+    border-radius: 0.875rem;
+    background-color: var(--surface-raised);
+    box-shadow: var(--shadow-card);
+  }
+
+  .pc-md-code-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    border-block-end: 1px solid var(--line);
+    background-color: color-mix(in oklab, var(--well) 72%, var(--sheet));
+    padding: 0.35rem 0.625rem 0.35rem 0.875rem;
+  }
+
+  .pc-md-codeblock pre {
+    margin: 0;
+    overflow-x: auto;
+    padding: 0.75rem 0.875rem;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    line-height: 1.55;
+    color: var(--ink);
+    tab-size: 2;
+  }
+
+  .pc-md-codeblock pre code {
+    font-family: inherit;
+    font-size: inherit;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: inherit;
+  }
+
+  .pc-copy {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    flex: none;
+  }
+
+  .pc-copy-tip {
+    position: absolute;
+    inset-inline-end: calc(100% + 0.375rem);
+    inset-block-start: 50%;
+    translate: 0 -50%;
+    pointer-events: none;
+    white-space: nowrap;
+    border-radius: 0.375rem;
+    border: 1px solid var(--line-strong);
+    background-color: var(--sheet);
+    padding: 0.125rem 0.45rem;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink);
+    opacity: 0;
+    transition: opacity 150ms ease;
+
+    @media (prefers-reduced-motion: reduce) {
+      transition-duration: 0.05s;
+    }
+  }
+
+  .pc-copy-btn[data-copied] + .pc-copy-tip,
+  .pc-copy-btn[data-failed] + .pc-copy-tip {
+    opacity: 1;
+  }
+
+  .pc-copy-btn[data-copied] {
+    border-color: color-mix(in oklab, var(--ok) 45%, transparent);
+    color: var(--ok);
+  }
+
+  .pc-copy-btn[data-failed] {
+    border-color: color-mix(in oklab, var(--danger) 45%, transparent);
+    color: var(--danger);
+  }
+
+  @media (hover: hover) {
+    .pc-copyable .pc-copy-btn {
+      opacity: 0;
+      transition: opacity 150ms ease, border-color 150ms ease, color 150ms ease;
+    }
+
+    .pc-copyable:hover .pc-copy-btn,
+    .pc-copyable:focus-within .pc-copy-btn,
+    .pc-copyable .pc-copy-btn:focus-visible,
+    .pc-copyable .pc-copy-btn[data-copied],
+    .pc-copyable .pc-copy-btn[data-failed] {
+      opacity: 1;
+    }
+  }
+
+  /* Responsive GFM Table with Sticky Headers */
+  .pc-md-table-wrap {
+    margin-block: 0.75em;
+    overflow: auto;
+    max-inline-size: 100%;
+    max-block-size: min(420px, 65vh);
+    border: 1px solid var(--line-strong);
+    border-radius: 0.75rem;
+    background-color: var(--sheet);
+  }
+
+  .pc-md-table-wrap table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+
+  .pc-md-table-wrap thead th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 1;
+    background-color: var(--well);
+    font-weight: 600;
+    color: var(--ink);
+    text-align: left;
+    border-block-end: 1px solid var(--line-strong);
+  }
+
+  .pc-md-table-wrap th,
+  .pc-md-table-wrap td {
+    padding: 0.45rem 0.75rem;
+    border-inline-end: 1px solid var(--line);
+    border-block-end: 1px solid var(--line);
+    vertical-align: top;
+    overflow-wrap: break-word;
+  }
+
+  .pc-md-table-wrap th:last-child,
+  .pc-md-table-wrap td:last-child {
+    border-inline-end: 0;
+  }
+
+  .pc-md-table-wrap tbody tr:last-child td {
+    border-block-end: 0;
+  }
+
+  .pc-md-table-wrap tbody tr:nth-child(even) td {
+    background-color: color-mix(in oklab, var(--well) 35%, transparent);
+  }
+
+  /* Sidebar Other-Workspaces Native Disclosure */
+  .pc-ws-details > summary {
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .pc-ws-details > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .pc-ws-chevron {
+    rotate: 0deg;
+
+    @media (prefers-reduced-motion: no-preference) {
+      transition: rotate 150ms ease;
+    }
+  }
+
+  .pc-ws-details[open] > summary .pc-ws-chevron {
+    rotate: 90deg;
+  }
+}
+
+@property --drawer-backdrop {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+/* ============================================================================
+   View Transitions: Circular Color-Scheme Reveal
+   ============================================================================ */
+.pc-vt-radial::view-transition-old(root),
+.pc-vt-radial::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+.pc-vt-radial::view-transition-new(root) {
+  z-index: 2;
+  animation: pc-vt-circle 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pc-vt-circle {
+  from {
+    clip-path: circle(0px at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+  to {
+    clip-path: circle(var(--vt-r, 150vmax) at var(--vt-x, 50%) var(--vt-y, 50%));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}
