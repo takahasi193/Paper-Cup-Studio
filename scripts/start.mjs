@@ -82,6 +82,11 @@ function npmCmd() {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
+function hasBin(dir, name) {
+  const binDir = path.join(dir, 'node_modules', '.bin');
+  return fs.existsSync(path.join(binDir, process.platform === 'win32' ? `${name}.cmd` : name));
+}
+
 function runSyncStep(label, args, cwd) {
   console.log(`[Paper Cup] ${label}...`);
   const res = spawnSync(npmCmd(), args, {
@@ -129,10 +134,20 @@ async function main() {
   checkNodeVersion();
   const opts = parseArgs(process.argv.slice(2));
 
-  if (!fs.existsSync(path.join(SERVER_DIR, 'node_modules'))) {
-    runSyncStep('安装服务端依赖 (server)', ['install'], SERVER_DIR);
+  const serverEntry = path.join(SERVER_DIR, 'dist', 'index.js');
+  const webEntry = path.join(WEB_DIR, 'dist', 'index.html');
+  const needServerBuildDeps = opts.dev || opts.rebuild || !fs.existsSync(serverEntry);
+  const needWebDeps = opts.dev || opts.rebuild || !fs.existsSync(webEntry);
+
+  if (
+    needServerBuildDeps
+      ? !hasBin(SERVER_DIR, 'tsx') || !hasBin(SERVER_DIR, 'tsc')
+      : !fs.existsSync(path.join(SERVER_DIR, 'node_modules'))
+  ) {
+    const installArgs = needServerBuildDeps ? ['install'] : ['install', '--omit=dev'];
+    runSyncStep('安装服务端依赖 (server)', installArgs, SERVER_DIR);
   }
-  if (!fs.existsSync(path.join(WEB_DIR, 'node_modules'))) {
+  if (needWebDeps && (!fs.existsSync(path.join(WEB_DIR, 'node_modules')) || !hasBin(WEB_DIR, 'vite'))) {
     runSyncStep('安装前端依赖 (web)', ['install'], WEB_DIR);
   }
 
@@ -205,9 +220,6 @@ async function main() {
     }
     return;
   }
-
-  const serverEntry = path.join(SERVER_DIR, 'dist', 'index.js');
-  const webEntry = path.join(WEB_DIR, 'dist', 'index.html');
 
   if (opts.rebuild || !fs.existsSync(serverEntry)) {
     runSyncStep('编译服务端 (server)', ['run', 'build'], SERVER_DIR);
