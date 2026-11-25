@@ -5,6 +5,45 @@
  * - 全程严禁在返回值、日志或错误信息中回显原始 API Key。
  */
 
+export const DEFAULT_MAGPIE_BASE_URL = 'http://127.0.0.1:3425/v1';
+export const MAGPIE_KEYLESS_RUNTIME_TOKEN = 'magpie';
+
+export function normalizeMagpieBaseUrl(
+  raw?: string | null,
+  fallback = DEFAULT_MAGPIE_BASE_URL
+): string {
+  const trimmed = String(raw ?? '').trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return fallback;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`Magpie 网关地址格式无效：${trimmed}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Magpie 网关地址仅支持 http:// 或 https:// 协议：${trimmed}`);
+  }
+  const cleanPathname = parsed.pathname.replace(/\/+$/, '');
+  if (!cleanPathname) {
+    return `${parsed.origin}/v1`;
+  }
+  return `${parsed.origin}${cleanPathname}${parsed.search}`;
+}
+
+export function resolveDefaultMagpieBaseUrl(): string {
+  const envUrl = process.env.MAGPIE_BASE_URL?.trim();
+  if (!envUrl) {
+    return DEFAULT_MAGPIE_BASE_URL;
+  }
+  try {
+    return normalizeMagpieBaseUrl(envUrl, DEFAULT_MAGPIE_BASE_URL);
+  } catch {
+    return DEFAULT_MAGPIE_BASE_URL;
+  }
+}
+
 export type ProviderProbeFetch = (
   input: string | URL | Request,
   init?: RequestInit
@@ -14,6 +53,7 @@ export interface DiscoveredLiveModel {
   id: string;
   name: string;
   reasoning: boolean;
+  contextWindow?: number;
 }
 
 export type DetectionMethod =
@@ -35,6 +75,7 @@ export interface ProviderDiscoveryResult {
 export interface KeyPrefixHint {
   exactProvider?: string;
   candidates: readonly string[];
+  fallbackCandidates?: readonly string[];
   ambiguous: boolean;
   label: string;
 }
@@ -44,6 +85,10 @@ interface ProviderProbeSpec {
   name: string;
   modelsUrl: string;
   authVerifyUrl?: string;
+  supportsBaseUrl?: boolean;
+  apiKeyOptional?: boolean;
+  resolveDefaultBaseUrl?: () => string;
+  normalizeBaseUrl?: (raw?: string | null, fallback?: string) => string;
   buildHeaders: (apiKey: string) => Record<string, string>;
   parseModels: (payload: any, providerId: string) => {
     models: DiscoveredLiveModel[];
@@ -54,7 +99,7 @@ interface ProviderProbeSpec {
 const JWT_RE = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const NON_CHAT_MODEL_RE =
+export const NON_CHAT_MODEL_RE =
   /(?:^|[-_/.:])(?:embed|embedding|embeddings|rerank|reranker|whisper|tts|asr|audio|speech|realtime|transcribe|transcription|moderation|dall-e|imagen|veo|sora|video|image-edit|text-to-image|image-to-image|stable-diffusion|sdxl|flux|kolors|cosyvoice|fish-speech|sensevoice|wan2|cogvideo|hunyuanvideo|babbage|davinci|curie|ada|robotics|computer-use|deep-research|aqa|lyria|chirp|search-preview|seedream|seedance|t2i|i2v|t2v|safeguard|shieldgemma)(?:$|[-_/.:])|^(?:dall-e|whisper|tts|text-embedding|omni-moderation|babbage|davinci)/i;
 
 const DEPRECATED_META_STATUS_RE = /^(?:deprecated|retired|disabled|inactive|shutdown|sunset|legacy|archived)$/i;
@@ -63,7 +108,7 @@ const DEPRECATED_TEXT_META_RE = /\b(?:deprecated|discontinued|retired|shut\s*dow
 function inferGenericReasoning(id: string): boolean {
   const lower = id.toLowerCase();
   if (
-    /(?:^|[-_./])(?:reason|reasoner|thinking|qwq|deepseek-r1|r1-distill|gpt-5|gpt-6|o3|o4|claude-(?:opus|sonnet|haiku|fable)-(?:4|5)|gemini-(?:2\.5|3|4)|grok-4|kimi-k2[.-]5|kimi-k3|glm-(?:4\.[5-9]|5|z1)|minimax-m)/i.test(
+    /(?:^|[-_./])(?:reason|reasoner|thinking|qwq|deepseek-r1|deepseek-v3[.-][12]|deepseek-v4|r1-distill|gpt-5|gpt-6|o1|o3|o4|claude-3[.-]7|claude-(?:opus|sonnet|haiku|fable)-(?:4|5)|gemini-(?:2\.5|3|4)|grok-4|qwen3|doubao-seed|kimi-k2[.-]5|kimi-k3|glm-(?:4\.[5-9]|5|z1)|minimax-m)/i.test(
       lower
     ) &&
     !/(?:chat-latest|non-thinking)/i.test(lower)
@@ -102,10 +147,7 @@ function isOutdatedProviderModelId(providerId: string, modelId: string): boolean
       /^gpt-4-(?:0314|0613|32k|turbo|vision|1106|0125)(?:$|-)/.test(bareId) ||
       /^gpt-4\.5(?:-|$)/.test(bareId) ||
       bareId === 'chatgpt-4o-latest' ||
-      /^gpt-4o(?:-\d{4}-\d{2}-\d{2})?$/.test(bareId) ||
-      /^gpt-4o-mini-\d{4}-\d{2}-\d{2}$/.test(bareId) ||
-      bareId === 'o1' ||
-      /^o1-(?:preview|mini|pro|\d{4})(?:$|-)/.test(bareId) ||
+      /^o1-(?:preview|mini)(?:$|-)/.test(bareId) ||
       /^ft:/.test(bareId) ||
       /^(?:text|code)-(?:davinci|curie|babbage|ada|cushman)/.test(bareId)
     ) {
@@ -128,7 +170,7 @@ function isOutdatedProviderModelId(providerId: string, modelId: string): boolean
   if (effectiveVendor === 'anthropic') {
     if (
       /^claude-(?:instant|2(?:\.[01])?)(?:$|-)/.test(bareId) ||
-      /^claude-3(?:$|[.-](?:opus|sonnet|haiku|5|7))/.test(bareId)
+      /^claude-3(?:$|[.-](?:opus|sonnet|haiku|5))/.test(bareId)
     ) {
       return true;
     }
@@ -249,33 +291,132 @@ export function isSupportedLiveChatModel(
   return true;
 }
 
+const MIN_VALID_CONTEXT_WINDOW = 2048;
+
+function parsePositiveContextWindow(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    if (Number.isFinite(value) && Number.isInteger(value) && value >= MIN_VALID_CONTEXT_WINDOW) {
+      return value;
+    }
+    return undefined;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = Number.parseInt(trimmed, 10);
+      if (Number.isSafeInteger(parsed) && parsed >= MIN_VALID_CONTEXT_WINDOW) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+const EXPLICIT_WINDOW_TAG_RE = /@(\d+(?:\.\d+)?)\s*([km])(?=$|[@\-_/:)\s])/i;
+const SUFFIX_WINDOW_TAG_RE = /(?:^|[\-_/:(])(\d+(?:\.\d+)?)\s*([km])(?=$|[@\-_/:)\s])/i;
+
+/**
+ * Infer a model's context window from standard naming conventions such as
+ * `@500k`, `-128k`, `-200k`, or `-1m` when the gateway omits numeric metadata.
+ */
+export function inferContextWindowFromModelId(modelId: string): number | undefined {
+  const trimmed = String(modelId ?? '').trim();
+  if (!trimmed) return undefined;
+  const match = EXPLICIT_WINDOW_TAG_RE.exec(trimmed) ?? SUFFIX_WINDOW_TAG_RE.exec(trimmed);
+  if (!match) return undefined;
+  const num = Number.parseFloat(match[1]);
+  if (!Number.isFinite(num) || num <= 0) return undefined;
+  const unit = match[2].toLowerCase();
+  if (unit === 'k') {
+    if (num < 8 || num > 10_000) return undefined;
+    return Math.round(num * 1000);
+  }
+  if (unit === 'm') {
+    if (num < 0.5 || num > 10) return undefined;
+    return Math.round(num * 1_000_000);
+  }
+  return undefined;
+}
+
+function extractModelContextWindow(rawEntry: unknown, modelId?: string): number | undefined {
+  const idFallback =
+    typeof modelId === 'string' && modelId.trim()
+      ? modelId.trim()
+      : rawEntry && typeof rawEntry === 'object' && typeof (rawEntry as any).id === 'string'
+        ? String((rawEntry as any).id).trim()
+        : '';
+  if (!rawEntry || typeof rawEntry !== 'object') {
+    return idFallback ? inferContextWindowFromModelId(idFallback) : undefined;
+  }
+  const entry = rawEntry as Record<string, unknown>;
+  const topProvider =
+    entry.top_provider && typeof entry.top_provider === 'object'
+      ? (entry.top_provider as Record<string, unknown>)
+      : undefined;
+  const limits =
+    entry.limits && typeof entry.limits === 'object'
+      ? (entry.limits as Record<string, unknown>)
+      : undefined;
+  const candidates: unknown[] = [
+    entry.context_length,
+    entry.context_window,
+    entry.max_model_len,
+    entry.max_context_length,
+    entry.max_context_tokens,
+    entry.context_size,
+    entry.input_token_limit,
+    entry.max_input_tokens,
+    entry.inputTokenLimit,
+    entry.contextWindow,
+    limits?.context,
+    topProvider?.context_length,
+    topProvider?.context_window,
+  ];
+  for (const candidate of candidates) {
+    const parsed = parsePositiveContextWindow(candidate);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+  return idFallback ? inferContextWindowFromModelId(idFallback) : undefined;
+}
+
 function parseOpenAIStyleCatalog(
   payload: any,
   providerId: string
 ): { models: DiscoveredLiveModel[]; rawCount: number } {
   const entries: any[] = Array.isArray(payload?.data)
     ? payload.data
-    : Array.isArray(payload)
-      ? payload
-      : [];
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : Array.isArray(payload)
+        ? payload
+        : [];
   const models: DiscoveredLiveModel[] = [];
   const seen = new Set<string>();
   for (const entry of entries) {
-    const id = typeof entry?.id === 'string' ? entry.id.trim() : '';
+    const id =
+      typeof entry === 'string'
+        ? entry.trim()
+        : typeof entry?.id === 'string'
+          ? entry.id.trim()
+          : '';
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    if (!isSupportedLiveChatModel(providerId, id, entry)) continue;
+    if (!isSupportedLiveChatModel(providerId, id, typeof entry === 'object' ? entry : undefined)) continue;
     const displayName =
       typeof entry?.display_name === 'string' && entry.display_name.trim()
         ? entry.display_name.trim()
         : typeof entry?.name === 'string' && entry.name.trim()
           ? entry.name.trim()
           : id;
+    const contextWindow = extractModelContextWindow(entry, id);
     models.push({
       id,
       name: displayName,
       reasoning:
         typeof entry?.reasoning === 'boolean' ? entry.reasoning : inferGenericReasoning(id),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
     });
   }
   return { models, rawCount: seen.size };
@@ -298,10 +439,12 @@ function parseGoogleCatalog(
       typeof entry?.displayName === 'string' && entry.displayName.trim()
         ? entry.displayName.trim()
         : id;
+    const contextWindow = extractModelContextWindow(entry, id);
     models.push({
       id,
       name: displayName,
       reasoning: inferGenericReasoning(id),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
     });
   }
   return { models, rawCount: seen.size };
@@ -405,6 +548,20 @@ const PROVIDER_PROBE_SPECS: Record<string, ProviderProbeSpec> = {
     buildHeaders: bearerHeaders,
     parseModels: parseOpenAIStyleCatalog,
   },
+  magpie: {
+    id: 'magpie',
+    name: 'Magpie (本地网关)',
+    modelsUrl: `${DEFAULT_MAGPIE_BASE_URL}/models`,
+    supportsBaseUrl: true,
+    apiKeyOptional: true,
+    resolveDefaultBaseUrl: resolveDefaultMagpieBaseUrl,
+    normalizeBaseUrl: normalizeMagpieBaseUrl,
+    buildHeaders: (apiKey) =>
+      apiKey.trim()
+        ? bearerHeaders(apiKey.trim())
+        : { Accept: 'application/json' },
+    parseModels: parseOpenAIStyleCatalog,
+  },
 };
 
 const AMBIGUOUS_SK_CANDIDATES = [
@@ -487,7 +644,7 @@ export function inferProviderHintsFromKey(apiKey: string): KeyPrefixHint {
       label: 'OpenAI',
     };
   }
-  if (/^sk-api-/i.test(key) || JWT_RE.test(key)) {
+  if (/^sk-api-/i.test(key)) {
     return {
       exactProvider: 'minimax',
       candidates: ['minimax'],
@@ -495,12 +652,22 @@ export function inferProviderHintsFromKey(apiKey: string): KeyPrefixHint {
       label: 'MiniMax',
     };
   }
+  if (JWT_RE.test(key)) {
+    return {
+      exactProvider: 'minimax',
+      candidates: ['minimax'],
+      fallbackCandidates: GENERIC_NON_SK_CANDIDATES.filter((p) => p !== 'minimax'),
+      ambiguous: false,
+      label: 'MiniMax / JWT 兼容网关',
+    };
+  }
   if (UUID_RE.test(key)) {
     return {
       exactProvider: 'volcengine',
       candidates: ['volcengine'],
+      fallbackCandidates: GENERIC_NON_SK_CANDIDATES.filter((p) => p !== 'volcengine'),
       ambiguous: false,
-      label: '火山方舟 (Volcengine Ark)',
+      label: '火山方舟 (Volcengine Ark) / UUID 兼容网关',
     };
   }
   if (/^sk-/i.test(key)) {
@@ -612,8 +779,10 @@ async function probeSingleProvider(
 export interface DiscoverProviderOptions {
   requestedProvider: string;
   apiKey: string;
+  baseUrl?: string;
   fetchImpl?: ProviderProbeFetch;
   offline?: boolean;
+  timeoutMs?: number;
 }
 
 /**
@@ -624,12 +793,16 @@ export async function discoverProviderAndModels(
 ): Promise<ProviderDiscoveryResult> {
   const trimmedKey = options.apiKey.trim();
   const requested = (options.requestedProvider || 'auto').trim();
-  const isAuto = !requested || requested.toLowerCase() === 'auto';
+  const requestedLower = requested.toLowerCase();
+  const isAuto = !requested || requestedLower === 'auto';
+  const baseSpec = !isAuto ? PROVIDER_PROBE_SPECS[requestedLower] ?? PROVIDER_PROBE_SPECS[requested] : undefined;
+  const apiKeyOptional = Boolean(baseSpec?.apiKeyOptional);
   const offline = options.offline ?? process.env.PI_OFFLINE !== undefined;
   const hasCustomFetch = Boolean(options.fetchImpl);
   const fetchFn: ProviderProbeFetch = options.fetchImpl ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? 4500;
 
-  if (!trimmedKey) {
+  if (!trimmedKey && !apiKeyOptional) {
     throw new Error('API Key cannot be empty.');
   }
 
@@ -658,12 +831,7 @@ export async function discoverProviderAndModels(
           filteredOutCount: 0,
         };
       }
-      const outcome = await probeSingleProvider(spec, trimmedKey, fetchFn);
-      if (outcome.kind === 'auth_error') {
-        throw new Error(
-          `已识别为 ${spec.name} 密钥格式，但网关鉴权被拒绝 (HTTP ${outcome.status})，请检查 API Key 是否有效。`
-        );
-      }
+      const outcome = await probeSingleProvider(spec, trimmedKey, fetchFn, timeoutMs);
       if (outcome.kind === 'ok') {
         return {
           provider: spec.id,
@@ -673,6 +841,42 @@ export async function discoverProviderAndModels(
           rawModelCount: outcome.rawCount,
           filteredOutCount: Math.max(0, outcome.rawCount - outcome.models.length),
         };
+      }
+
+      if (hint.fallbackCandidates && hint.fallbackCandidates.length > 0) {
+        const fallbackSpecs = hint.fallbackCandidates
+          .map((id) => PROVIDER_PROBE_SPECS[id])
+          .filter((s): s is ProviderProbeSpec => Boolean(s));
+        if (fallbackSpecs.length > 0) {
+          const fallbackResults = await Promise.all(
+            fallbackSpecs.map((s) => probeSingleProvider(s, trimmedKey, fetchFn, timeoutMs))
+          );
+          const fallbackMatched = fallbackResults.find(
+            (r): r is Extract<ProbeOutcome, { kind: 'ok' }> => r.kind === 'ok'
+          );
+          if (fallbackMatched) {
+            return {
+              provider: fallbackMatched.provider,
+              providerName: fallbackMatched.providerName,
+              detectionMethod: 'probe',
+              liveModels: fallbackMatched.models,
+              rawModelCount: fallbackMatched.rawCount,
+              filteredOutCount: Math.max(0, fallbackMatched.rawCount - fallbackMatched.models.length),
+            };
+          }
+          if (outcome.kind === 'auth_error' || fallbackResults.some((r) => r.kind === 'auth_error')) {
+            const tried = [spec.id, ...fallbackSpecs.map((s) => s.id)].join(' / ');
+            throw new Error(
+              `已自动探测 ${tried}，均返回鉴权失败；请检查密钥是否正确或手动选择对应提供商。`
+            );
+          }
+        }
+      }
+
+      if (outcome.kind === 'auth_error') {
+        throw new Error(
+          `已识别为 ${spec.name} 密钥格式，但网关鉴权被拒绝 (HTTP ${outcome.status})，请检查 API Key 是否有效。`
+        );
       }
       return {
         provider: spec.id,
@@ -696,7 +900,7 @@ export async function discoverProviderAndModels(
       .filter((s): s is ProviderProbeSpec => Boolean(s));
 
     const results = await Promise.all(
-      candidateSpecs.map((spec) => probeSingleProvider(spec, trimmedKey, fetchFn))
+      candidateSpecs.map((spec) => probeSingleProvider(spec, trimmedKey, fetchFn, timeoutMs))
     );
 
     const matched = results.find(
@@ -725,11 +929,10 @@ export async function discoverProviderAndModels(
   }
 
   // Manual provider selected by user
-  const spec = PROVIDER_PROBE_SPECS[requested];
-  if (!spec || (offline && !hasCustomFetch)) {
+  if (!baseSpec) {
     return {
       provider: requested,
-      providerName: spec?.name || requested,
+      providerName: requested,
       detectionMethod: 'manual-offline',
       liveModels: null,
       rawModelCount: 0,
@@ -737,25 +940,60 @@ export async function discoverProviderAndModels(
     };
   }
 
-  const outcome = await probeSingleProvider(spec, trimmedKey, fetchFn);
+  let effectiveSpec = baseSpec;
+  if (baseSpec.supportsBaseUrl) {
+    const defaultBaseUrl = baseSpec.resolveDefaultBaseUrl?.() ?? baseSpec.modelsUrl.replace(/\/models$/i, '');
+    const normalizedBaseUrl = baseSpec.normalizeBaseUrl
+      ? baseSpec.normalizeBaseUrl(options.baseUrl, defaultBaseUrl)
+      : (options.baseUrl?.trim().replace(/\/+$/, '') || defaultBaseUrl);
+    effectiveSpec = {
+      ...baseSpec,
+      modelsUrl: `${normalizedBaseUrl}/models`,
+    };
+  }
+
+  if (offline && !hasCustomFetch) {
+    return {
+      provider: effectiveSpec.id,
+      providerName: effectiveSpec.name,
+      detectionMethod: 'manual-offline',
+      liveModels: null,
+      rawModelCount: 0,
+      filteredOutCount: 0,
+    };
+  }
+
+  const outcome = await probeSingleProvider(effectiveSpec, trimmedKey, fetchFn, timeoutMs);
   if (outcome.kind === 'auth_error') {
+    if (effectiveSpec.apiKeyOptional) {
+      throw new Error(
+        `${effectiveSpec.name} 鉴权失败 (HTTP ${outcome.status})，请在 API Key 栏填写正确的访问令牌。`
+      );
+    }
     throw new Error(
-      `${spec.name} 鉴权失败 (HTTP ${outcome.status})，请检查该 API Key 是否属于 ${spec.name} 且处于有效状态。`
+      `${effectiveSpec.name} 鉴权失败 (HTTP ${outcome.status})，请检查该 API Key 是否属于 ${effectiveSpec.name} 且处于有效状态。`
     );
   }
   if (outcome.kind === 'ok') {
     return {
-      provider: spec.id,
-      providerName: spec.name,
+      provider: effectiveSpec.id,
+      providerName: effectiveSpec.name,
       detectionMethod: 'manual-verified',
       liveModels: outcome.models,
       rawModelCount: outcome.rawCount,
       filteredOutCount: Math.max(0, outcome.rawCount - outcome.models.length),
     };
   }
+  if (effectiveSpec.supportsBaseUrl) {
+    throw new Error(
+      `无法连接 ${effectiveSpec.name} (${effectiveSpec.modelsUrl})${
+        outcome.status ? ` (HTTP ${outcome.status})` : ''
+      }，请确认网关已启动且地址与端口配置正确。`
+    );
+  }
   return {
-    provider: spec.id,
-    providerName: spec.name,
+    provider: effectiveSpec.id,
+    providerName: effectiveSpec.name,
     detectionMethod: 'manual-offline',
     liveModels: null,
     rawModelCount: 0,

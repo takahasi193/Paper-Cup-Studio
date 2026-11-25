@@ -7,8 +7,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { WORKSPACE_CHARACTERS_REL, resolveWorkspacePaths } from './workspace-paths.js';
+import { findSkillPackageByEngine } from './skill-registry.js';
+import { normalizeProxyDllName, type ProxyDllName } from './win32-proxy.js';
 
-export const POV_VALUES = new Set(['first', 'second', 'third', 'mixed']);
+export const POV_VALUES = new Set(['first', 'second', 'third', 'mixed', 'source']);
 const SLUG_BAD = /[^A-Za-z0-9._-]+/g;
 const MAX_LESSONS = 3;
 const MAX_JSON_BYTES = 2 * 1024 * 1024;
@@ -22,8 +25,8 @@ export class DecodeError extends Error {
   }
 }
 export class EncodeError extends Error {
-  constructor(public readonly encoding: string) {
-    super(`无法用编码 ${encoding} 表示发布稿`);
+  constructor(public readonly encoding: string, detail?: string) {
+    super(detail ? `无法用编码 ${encoding} 表示发布稿：${detail}` : `无法用编码 ${encoding} 表示发布稿`);
   }
 }
 
@@ -37,8 +40,41 @@ export interface LocalizationProfile {
   maxLenAbs: number;
   requireGlossary: boolean;
   residueCheck: boolean;
+  requireCharacterConfirmation?: boolean;
   glossaryFile: string;
   personaFile: string;
+}
+
+export const CHARACTERS_REL = WORKSPACE_CHARACTERS_REL;
+
+export type CharacterGender = 'female' | 'male' | 'unknown' | 'other';
+
+export interface CharacterAlias {
+  source: string;
+  target: string;
+}
+
+export interface CharacterRosterEntry {
+  id: string;
+  sourceName: string;
+  targetName: string;
+  speakerIds: string[];
+  aliases: CharacterAlias[];
+  gender: CharacterGender;
+  note?: string;
+  occurrences: number;
+  samples: string[];
+}
+
+export interface CharacterRosterStore {
+  schema: 1;
+  status: 'draft' | 'locked';
+  classifyDigest: string;
+  updatedAt: string;
+  confirmedAt?: string;
+  formId?: string;
+  characters: CharacterRosterEntry[];
+  dismissedNames?: string[];
 }
 
 export interface ProfileLoad {
@@ -70,6 +106,8 @@ export interface ProjectMemory {
   persona: Record<string, PersonaCard>;
   lessons: Array<{ cue: string; lesson: string; evidence: string }>;
   personaErrors: string[];
+  characters?: CharacterRosterEntry[];
+  charactersStatus?: 'none' | 'draft' | 'locked';
 }
 
 export interface ReadinessState {
@@ -108,7 +146,7 @@ function normCaseForHash(p: string): string {
 export function projectStorageDir(workspace: string, homeDir?: string | null): string {
   const resolved = realpathSafe(workspace);
   if (!homeDir) {
-    return path.join(resolved, '.papercup', 'sessions');
+    return resolveWorkspacePaths(resolved).sessionsDir;
   }
   const digest = crypto.createHash('sha256').update(normCaseForHash(resolved), 'utf8').digest('hex').slice(0, 8);
   return path.join(homeDir, 'projects', `${slug(path.basename(resolved))}_${digest}`, 'sessions');
@@ -122,11 +160,43 @@ export function projectHarnessDir(workspace: string, homeDir?: string | null): s
   return path.join(path.dirname(projectStorageDir(workspace, homeDir)), 'harness');
 }
 
+export function resolvePathWithAncestors(targetPath: string, maxSymlinkHops = 16): string | null {
+  let cur = path.resolve(targetPath);
+  const tail: string[] = [];
+  let hops = 0;
+
+  while (true) {
+    if (isSymlinkPath(cur)) {
+      if (hops >= maxSymlinkHops) return null;
+      hops++;
+      try {
+        const rawTarget = fs.readlinkSync(cur);
+        const cleanedTarget = process.platform === 'win32' ? rawTarget.replace(/^\\\\\?\\/, '') : rawTarget;
+        cur = path.resolve(path.dirname(cur), cleanedTarget);
+        continue;
+      } catch {
+        return null;
+      }
+    }
+    if (fs.existsSync(cur)) {
+      const real = realpathSafe(cur);
+      return tail.length ? path.resolve(real, ...tail.reverse()) : real;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) {
+      return tail.length ? path.resolve(cur, ...tail.reverse()) : cur;
+    }
+    tail.push(path.basename(cur));
+    cur = parent;
+  }
+}
+
 export function insideWorkspace(workspace: string, candidatePath: string): string | null {
   try {
     const base = realpathSafe(workspace);
-    const abs = path.isAbsolute(candidatePath) ? candidatePath : path.join(base, candidatePath);
-    const resolved = fs.existsSync(abs) ? realpathSafe(abs) : path.resolve(abs);
+    const abs = path.isAbsolute(candidatePath) ? path.resolve(candidatePath) : path.resolve(base, candidatePath);
+    const resolved = resolvePathWithAncestors(abs);
+    if (!resolved) return null;
     const rel = path.relative(base, resolved);
     if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
       return resolved;
@@ -199,7 +269,72 @@ function parseTomlValue(raw: string): unknown {
   return s;
 }
 
-function parseLocalizationToml(text: string): Record<string, unknown> {
+export type TranslatorMode = 'cloud_subagent' | 'local_mt';
+export type LocalMtPreset = 'sakura' | 'hy-mt' | 'plain-lines';
+
+export interface TranslatorOverrideConfig {
+  mode?: TranslatorMode;
+  baseUrl?: string;
+  model?: string;
+  ollamaPath?: string;
+  preset?: LocalMtPreset;
+  packetLines?: number;
+  concurrency?: number;
+  contextWindow?: number;
+  timeoutMs?: number;
+  escalateFailedRows?: boolean;
+  useTmCache?: boolean;
+  disableThinking?: boolean;
+}
+
+export type PatchHookMode = 'auto' | 'win32_proxy' | 'none';
+export type RuntimeCharsetHint = 'shift_jis' | 'gbk' | 'unicode';
+
+export function normalizeRuntimeCharsetHint(raw?: unknown): RuntimeCharsetHint | undefined {
+  if (typeof raw === 'number') {
+    if (raw === 128) return 'shift_jis';
+    if (raw === 134) return 'gbk';
+    return undefined;
+  }
+  if (typeof raw !== 'string') return undefined;
+  const s = raw.trim().toLowerCase();
+  if (!s) return undefined;
+  if (s === 'shift_jis' || s === 'shift-jis' || s === 'sjis' || s === 'cp932' || s === '0x80' || s === '128') {
+    return 'shift_jis';
+  }
+  if (s === 'gbk' || s === 'cp936' || s === 'gb2312' || s === '0x86' || s === '134') {
+    return 'gbk';
+  }
+  if (
+    s === 'unicode' ||
+    s === 'utf-8' ||
+    s === 'utf8' ||
+    s === 'utf-16' ||
+    s === 'utf16' ||
+    s === 'utf-16le' ||
+    s === 'utf-16le-bom' ||
+    s === 'utf-8-bom'
+  ) {
+    return 'unicode';
+  }
+  return undefined;
+}
+
+export interface PatchConfig {
+  mode: 'delta_patch';
+  encoding: string;
+  hookMode: PatchHookMode;
+  proxyDll?: ProxyDllName;
+  runtimeCharset?: RuntimeCharsetHint;
+  codepage?: number;
+  charset?: number;
+  fontName?: string;
+  forceFontName?: boolean;
+  enableWidthCompat?: boolean;
+  customOptions?: Record<string, string | number | boolean>;
+}
+
+export function parseTomlSections(text: string): Record<string, Record<string, unknown>> {
   const sections: Record<string, Record<string, unknown>> = {};
   let currentSection = '';
   const cleaned = text.replace(/^\uFEFF/, '');
@@ -218,13 +353,206 @@ function parseLocalizationToml(text: string): Record<string, unknown> {
     if (!sections[currentSection]) sections[currentSection] = {};
     sections[currentSection][key] = val;
   }
-  return sections['vn.localization'] || {};
+  return sections;
+}
+
+function parseLocalizationToml(text: string): Record<string, unknown> {
+  return parseTomlSections(text)['vn.localization'] || {};
+}
+
+export function pickTomlString(tbl: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const v = tbl[key];
+    if (typeof v === 'string' && v.trim()) {
+      return v.trim();
+    }
+  }
+  return undefined;
+}
+
+export function pickTomlBool(tbl: Record<string, unknown>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const v = tbl[key];
+    if (typeof v === 'boolean') return v;
+  }
+  return undefined;
+}
+
+export function pickTomlInt(
+  tbl: Record<string, unknown>,
+  min: number,
+  max: number,
+  ...keys: string[]
+): number | undefined {
+  for (const key of keys) {
+    const v = tbl[key];
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      return Math.max(min, Math.min(max, Math.round(v)));
+    }
+  }
+  return undefined;
+}
+
+export function readWorkspaceTomlSection(workspace: string, section: string): Record<string, unknown> | null {
+  const wsPaths = resolveWorkspacePaths(workspace);
+  const candidates = [
+    wsPaths.profileTomlFile,
+    wsPaths.papercupTomlFile,
+  ];
+  for (const cand of candidates) {
+    if (isSymlinkPath(cand) || !fs.existsSync(cand)) continue;
+    try {
+      if (!fs.statSync(cand).isFile()) continue;
+      const raw = fs.readFileSync(cand, 'utf8');
+      const tbl = parseTomlSections(raw)[section];
+      if (!tbl || Object.keys(tbl).length === 0) continue;
+      return tbl;
+    } catch {
+      // Ignore unreadable override file
+    }
+  }
+  return null;
+}
+
+export function loadWorkspaceTranslatorOverride(workspace: string): TranslatorOverrideConfig | null {
+  const tbl = readWorkspaceTomlSection(workspace, 'vn.translator');
+  if (!tbl) return null;
+
+  const out: TranslatorOverrideConfig = {};
+  const rawMode = pickTomlString(tbl, 'mode');
+  if (rawMode === 'cloud_subagent' || rawMode === 'local_mt') {
+    out.mode = rawMode;
+  }
+  const baseUrl = pickTomlString(tbl, 'base_url', 'baseUrl');
+  if (baseUrl) {
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        out.baseUrl = baseUrl.replace(/\/+$/, '');
+      }
+    } catch {
+      // Ignore invalid URL in workspace override
+    }
+  }
+  const model = pickTomlString(tbl, 'model');
+  if (model) out.model = model;
+
+  const ollamaPath = pickTomlString(tbl, 'ollama_path', 'ollamaPath');
+  if (ollamaPath) out.ollamaPath = ollamaPath;
+
+  const rawPreset = pickTomlString(tbl, 'preset');
+  if (rawPreset === 'sakura' || rawPreset === 'hy-mt' || rawPreset === 'plain-lines') {
+    out.preset = rawPreset;
+  }
+
+  const packetLines = pickTomlInt(tbl, 1, 50, 'packet_lines', 'packetLines');
+  if (packetLines !== undefined) out.packetLines = packetLines;
+
+  const concurrency = pickTomlInt(tbl, 1, 8, 'concurrency');
+  if (concurrency !== undefined) out.concurrency = concurrency;
+
+  const contextWindow = pickTomlInt(tbl, 0, 12, 'context_window', 'contextWindow');
+  if (contextWindow !== undefined) out.contextWindow = contextWindow;
+
+  const timeoutMs = pickTomlInt(tbl, 5000, 600000, 'timeout_ms', 'timeoutMs');
+  if (timeoutMs !== undefined) out.timeoutMs = timeoutMs;
+
+  const escalateFailedRows = pickTomlBool(tbl, 'escalate_failed_rows', 'escalateFailedRows');
+  if (escalateFailedRows !== undefined) out.escalateFailedRows = escalateFailedRows;
+
+  const useTmCache = pickTomlBool(tbl, 'use_tm_cache', 'useTmCache');
+  if (useTmCache !== undefined) out.useTmCache = useTmCache;
+
+  const disableThinking = pickTomlBool(tbl, 'disable_thinking', 'disableThinking');
+  if (disableThinking !== undefined) out.disableThinking = disableThinking;
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+const RESERVED_PATCH_TOML_KEYS = new Set([
+  'mode',
+  'encoding',
+  'hook_mode',
+  'hookMode',
+  'proxy_dll',
+  'proxyDll',
+  'runtime_charset',
+  'runtimeCharset',
+  'codepage',
+  'charset',
+  'font_name',
+  'fontName',
+  'force_font_name',
+  'forceFontName',
+  'enable_width_compat',
+  'enableWidthCompat',
+]);
+
+export function loadWorkspacePatchConfig(workspace: string): PatchConfig {
+  const out: PatchConfig = {
+    mode: 'delta_patch',
+    encoding: 'auto',
+    hookMode: 'auto',
+  };
+  const tbl = readWorkspaceTomlSection(workspace, 'vn.patch');
+  if (!tbl) return out;
+
+  const rawEncoding = pickTomlString(tbl, 'encoding');
+  if (rawEncoding) {
+    const trimmed = rawEncoding.trim();
+    const low = trimmed.toLowerCase();
+    if (low === 'auto') {
+      out.encoding = 'auto';
+    } else {
+      const builtin = tryNormalizeBuiltinEncoding(trimmed);
+      if (builtin) {
+        out.encoding = builtin;
+      } else if (isSafeCustomEncodingName(trimmed)) {
+        // Keep declared custom encoding name for downstream validation against skill engine.json
+        out.encoding = low;
+      } else {
+        throw new Error(`不支持的写回编码：${rawEncoding}`);
+      }
+    }
+  }
+  const rawHook = pickTomlString(tbl, 'hook_mode', 'hookMode');
+  if (rawHook === 'auto' || rawHook === 'win32_proxy' || rawHook === 'none') {
+    out.hookMode = rawHook;
+  }
+  const proxyDll = normalizeProxyDllName(pickTomlString(tbl, 'proxy_dll', 'proxyDll'));
+  if (proxyDll) out.proxyDll = proxyDll;
+  const runtimeCharset = normalizeRuntimeCharsetHint(tbl.runtime_charset ?? tbl.runtimeCharset);
+  if (runtimeCharset) out.runtimeCharset = runtimeCharset;
+  const codepage = pickTomlInt(tbl, 1, 65001, 'codepage');
+  if (codepage !== undefined) out.codepage = codepage;
+  const charset = pickTomlInt(tbl, 0, 255, 'charset');
+  if (charset !== undefined) out.charset = charset;
+  const fontName = pickTomlString(tbl, 'font_name', 'fontName');
+  if (fontName) out.fontName = fontName;
+  const forceFontName = pickTomlBool(tbl, 'force_font_name', 'forceFontName');
+  if (forceFontName !== undefined) out.forceFontName = forceFontName;
+  const enableWidthCompat = pickTomlBool(tbl, 'enable_width_compat', 'enableWidthCompat');
+  if (enableWidthCompat !== undefined) out.enableWidthCompat = enableWidthCompat;
+
+  const customOptions: Record<string, string | number | boolean> = {};
+  for (const [key, val] of Object.entries(tbl)) {
+    if (RESERVED_PATCH_TOML_KEYS.has(key)) continue;
+    if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+      customOptions[key] = val;
+    }
+  }
+  if (Object.keys(customOptions).length > 0) {
+    out.customOptions = customOptions;
+  }
+
+  return out;
 }
 
 export function loadProfile(workspace: string): ProfileLoad {
+  const wsPaths = resolveWorkspacePaths(workspace);
   const candidates = [
-    path.join(workspace, '.papercup', 'vn', 'profile.toml'),
-    path.join(workspace, 'papercup.toml'),
+    wsPaths.profileTomlFile,
+    wsPaths.papercupTomlFile,
   ];
   let chosen: string | null = null;
   for (const cand of candidates) {
@@ -250,7 +578,7 @@ export function loadProfile(workspace: string): ProfileLoad {
   const errors: string[] = [];
   const pov = typeof tbl.narrative_pov === 'string' ? tbl.narrative_pov.trim().toLowerCase() : '';
   if (!pov || !POV_VALUES.has(pov)) {
-    errors.push('narrative_pov 必须是 first、second、third 或 mixed。');
+    errors.push('narrative_pov 必须是 first、second、third、mixed 或 source（跟随原文）。');
   }
   const playerAddress = typeof tbl.player_address === 'string' ? tbl.player_address.trim() : '';
   const mixedRules = typeof tbl.mixed_rules === 'string' ? tbl.mixed_rules.trim() : '';
@@ -266,6 +594,8 @@ export function loadProfile(workspace: string): ProfileLoad {
       : 0;
   const requireGlossary = typeof tbl.require_glossary === 'boolean' ? tbl.require_glossary : false;
   const residueCheck = typeof tbl.residue_check === 'boolean' ? tbl.residue_check : true;
+  const requireCharacterConfirmation =
+    typeof tbl.require_character_confirmation === 'boolean' ? tbl.require_character_confirmation : true;
   const glossaryFile = typeof tbl.glossary_file === 'string' ? tbl.glossary_file.trim() : '';
   const personaFile = typeof tbl.persona_file === 'string' ? tbl.persona_file.trim() : '';
 
@@ -285,6 +615,7 @@ export function loadProfile(workspace: string): ProfileLoad {
       maxLenAbs,
       requireGlossary,
       residueCheck,
+      requireCharacterConfirmation,
       glossaryFile,
       personaFile,
     },
@@ -303,6 +634,104 @@ function readJsonObject(filePath: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+const ENGINE_NAME_SAFE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function extractControlPatternFromEngineJson(obj: Record<string, unknown> | null): string | null {
+  if (!obj) return null;
+  const wb = obj.writeback;
+  if (wb && typeof wb === 'object' && !Array.isArray(wb)) {
+    const wbPat = (wb as Record<string, unknown>).control_pattern;
+    if (typeof wbPat === 'string' && wbPat.trim()) {
+      return wbPat.trim();
+    }
+  }
+  const topPat = obj.control_pattern;
+  if (typeof topPat === 'string' && topPat.trim()) {
+    return topPat.trim();
+  }
+  return null;
+}
+
+function readSmallEngineJsonObject(filePath: string): Record<string, unknown> | null {
+  try {
+    if (isSymlinkPath(filePath) || !fs.existsSync(filePath)) return null;
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > 32 * 1024) return null;
+    const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveWorkspaceControlPattern(
+  workspace: string,
+  homeDir?: string | null,
+  explicitEngine?: string
+): string | null {
+  const ws = realpathSafe(workspace);
+  const effectiveHome = homeDir === undefined ? resolveHomeDir() : homeDir;
+  const normExplicit = (explicitEngine || '').trim().toLowerCase();
+
+  // 1) Project-level harness engine.json takes precedence when engine matches or is unspecified
+  const projJson = readSmallEngineJsonObject(path.join(projectHarnessDir(ws, effectiveHome), 'engine.json'));
+  const projEngine = typeof projJson?.name === 'string' ? projJson.name.trim().toLowerCase() : '';
+  if (projJson && (!normExplicit || !projEngine || projEngine === normExplicit)) {
+    const pat = extractControlPatternFromEngineJson(projJson);
+    if (pat) return pat;
+  }
+
+  // 2) Resolve candidate engine name from explicit arg -> .papercup/data/vn/text.json -> project harness -> unpacked skill manifest
+  const wsPaths = resolveWorkspacePaths(ws);
+  const candidateEngines: string[] = [];
+  const pushEng = (val: unknown) => {
+    const s = typeof val === 'string' ? val.trim().toLowerCase() : '';
+    if (s && ENGINE_NAME_SAFE_RE.test(s) && !candidateEngines.includes(s)) {
+      candidateEngines.push(s);
+    }
+  };
+  pushEng(normExplicit);
+  const textManifest = readJsonObject(wsPaths.textManifestFile);
+  pushEng(textManifest?.engine);
+  pushEng(projEngine);
+
+  if (candidateEngines.length === 0) {
+    const unpackedDir = wsPaths.unpackedDir;
+    if (!isSymlinkPath(unpackedDir) && fs.existsSync(unpackedDir)) {
+      try {
+        if (fs.statSync(unpackedDir).isDirectory()) {
+          const directManifest = readSmallEngineJsonObject(path.join(unpackedDir, '.skill-manifest.json'));
+          pushEng(directManifest?.engine);
+          for (const ent of fs.readdirSync(unpackedDir, { withFileTypes: true })) {
+            if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
+            const subManifest = readSmallEngineJsonObject(path.join(unpackedDir, ent.name, '.skill-manifest.json'));
+            pushEng(subManifest?.engine);
+          }
+        }
+      } catch {
+        // Ignore unreadable unpacked directory
+      }
+    }
+  }
+
+  // 3) 3-tier self-contained skill registry (workspace > global > repo)
+  for (const eng of candidateEngines) {
+    const pkg = findSkillPackageByEngine(eng, ws, { homeDir: effectiveHome });
+    const pat = extractControlPatternFromEngineJson(pkg?.engineJson ?? null);
+    if (pat) return pat;
+  }
+
+  if (effectiveHome) {
+    for (const eng of candidateEngines) {
+      const globalJson = readSmallEngineJsonObject(path.join(effectiveHome, 'engines', eng, 'engine.json'));
+      const pat = extractControlPatternFromEngineJson(globalJson);
+      if (pat) return pat;
+    }
+  }
+  return null;
 }
 
 export function parsePersonaMap(data: Record<string, unknown>): {
@@ -328,28 +757,55 @@ export function parsePersonaMap(data: Record<string, unknown>): {
       continue;
     }
     const obj = val as Record<string, unknown>;
+    if (obj.base !== undefined && typeof obj.base !== 'string') {
+      errors.push(`人设「${name}」的 base 必须是字符串。`);
+    }
     const base = typeof obj.base === 'string' ? obj.base.trim() : '';
     const stages: PersonaStage[] = [];
     const twists: PersonaTwist[] = [];
-    if (Array.isArray(obj.stages)) {
-      for (const st of obj.stages) {
-        if (st && typeof st === 'object' && !Array.isArray(st)) {
+    if (obj.stages !== undefined) {
+      if (!Array.isArray(obj.stages)) {
+        errors.push(`人设「${name}」的 stages 必须是数组。`);
+      } else {
+        obj.stages.forEach((st, idx) => {
+          if (!st || typeof st !== 'object' || Array.isArray(st)) {
+            errors.push(`人设「${name}」的 stages[${idx}] 必须是对象。`);
+            return;
+          }
           const rec = st as Record<string, unknown>;
           const from = typeof rec.from === 'string' ? rec.from.trim() : '';
           const voice = typeof rec.voice === 'string' ? rec.voice.trim() : '';
-          if (from && voice) stages.push({ fromScene: from, voice });
-        }
+          if (!from || !voice) {
+            errors.push(`人设「${name}」的 stages[${idx}] 必须包含非空字符串 from 与 voice。`);
+            return;
+          }
+          stages.push({ fromScene: from, voice });
+        });
       }
     }
-    if (Array.isArray(obj.twists)) {
-      for (const tw of obj.twists) {
-        if (tw && typeof tw === 'object' && !Array.isArray(tw)) {
+    if (obj.twists !== undefined) {
+      if (!Array.isArray(obj.twists)) {
+        errors.push(`人设「${name}」的 twists 必须是数组。`);
+      } else {
+        obj.twists.forEach((tw, idx) => {
+          if (!tw || typeof tw !== 'object' || Array.isArray(tw)) {
+            errors.push(`人设「${name}」的 twists[${idx}] 必须是对象。`);
+            return;
+          }
           const rec = tw as Record<string, unknown>;
           const at = typeof rec.at === 'string' ? rec.at.trim() : '';
           const note = typeof rec.note === 'string' ? rec.note.trim() : '';
+          if (rec.reveals !== undefined && typeof rec.reveals !== 'string') {
+            errors.push(`人设「${name}」的 twists[${idx}].reveals 必须是字符串。`);
+            return;
+          }
           const reveals = typeof rec.reveals === 'string' ? rec.reveals.trim() : '';
-          if (at && note) twists.push({ atScene: at, note, reveals });
-        }
+          if (!at || !note) {
+            errors.push(`人设「${name}」的 twists[${idx}] 必须包含非空字符串 at 与 note。`);
+            return;
+          }
+          twists.push({ atScene: at, note, reveals });
+        });
       }
     }
     if (!base && stages.length === 0 && twists.length === 0) {
@@ -404,6 +860,126 @@ export function loadMemory(workspace: string, homeDir?: string | null): ProjectM
   };
 }
 
+export function normalizeCharacterGender(raw: unknown): CharacterGender {
+  const s = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (s === 'female' || s === 'f' || s === '女' || s === '女性') return 'female';
+  if (s === 'male' || s === 'm' || s === '男' || s === '男性') return 'male';
+  if (s === 'other' || s === '其他' || s === '非二元' || s === '中性') return 'other';
+  return 'unknown';
+}
+
+export function readCharacterRoster(workspace: string): CharacterRosterStore | null {
+  const wsPaths = resolveWorkspacePaths(workspace);
+  const raw = readJsonObject(wsPaths.charactersFile);
+  if (!raw || raw.schema !== 1 || !Array.isArray(raw.characters)) return null;
+  const status: 'draft' | 'locked' = raw.status === 'locked' ? 'locked' : 'draft';
+  const characters: CharacterRosterEntry[] = [];
+  for (const item of raw.characters) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const rec = item as Record<string, unknown>;
+    const sourceName = String(rec.sourceName ?? '').replace(/[\r\n]+/g, ' ').trim();
+    const targetName = String(rec.targetName ?? '').replace(/[\r\n]+/g, ' ').trim();
+    if (!sourceName) continue;
+    const id =
+      String(rec.id ?? '').replace(/[\r\n]+/g, ' ').trim() ||
+      `ch_${crypto.createHash('sha256').update(sourceName, 'utf8').digest('hex').slice(0, 8)}`;
+    const speakerIds = Array.isArray(rec.speakerIds)
+      ? Array.from(
+          new Set(
+            rec.speakerIds
+              .map((s) => String(s ?? '').replace(/[\r\n]+/g, ' ').trim())
+              .filter(Boolean)
+          )
+        )
+      : [];
+    const aliases: CharacterAlias[] = [];
+    const seenAlias = new Set<string>();
+    if (Array.isArray(rec.aliases)) {
+      for (const a of rec.aliases) {
+        if (!a || typeof a !== 'object') continue;
+        const ar = a as Record<string, unknown>;
+        const as = String(ar.source ?? '').replace(/[\r\n]+/g, ' ').trim();
+        const at = String(ar.target ?? '').replace(/[\r\n]+/g, ' ').trim();
+        if (!as || !at || as === sourceName || seenAlias.has(as)) continue;
+        seenAlias.add(as);
+        aliases.push({ source: as, target: at });
+      }
+    }
+    const samples = Array.isArray(rec.samples)
+      ? Array.from(
+          new Set(
+            rec.samples
+              .map((s) => String(s ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 80))
+              .filter(Boolean)
+          )
+        ).slice(0, 3)
+      : [];
+    const note = String(rec.note ?? '').replace(/[\r\n]+/g, ' ').trim();
+    const occ =
+      typeof rec.occurrences === 'number' && Number.isFinite(rec.occurrences) && rec.occurrences >= 0
+        ? Math.floor(rec.occurrences)
+        : 0;
+    characters.push({
+      id,
+      sourceName,
+      targetName,
+      speakerIds,
+      aliases,
+      gender: normalizeCharacterGender(rec.gender),
+      ...(note ? { note } : {}),
+      occurrences: occ,
+      samples,
+    });
+  }
+  const dismissedNames = Array.isArray(raw.dismissedNames)
+    ? Array.from(
+        new Set(
+          raw.dismissedNames
+            .map((s) => String(s ?? '').replace(/[\r\n]+/g, ' ').trim())
+            .filter(Boolean)
+        )
+      )
+    : [];
+  return {
+    schema: 1,
+    status,
+    classifyDigest: typeof raw.classifyDigest === 'string' ? raw.classifyDigest.trim() : '',
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
+    ...(typeof raw.confirmedAt === 'string' && raw.confirmedAt ? { confirmedAt: raw.confirmedAt } : {}),
+    ...(typeof raw.formId === 'string' && raw.formId ? { formId: raw.formId } : {}),
+    characters,
+    ...(dismissedNames.length ? { dismissedNames } : {}),
+  };
+}
+
+const PURE_KANA_READING_RE = /^[\u3041-\u3096\u309D-\u309F\u30A1-\u30FA\u30FD-\u30FF\u30FC・･\s]+$/;
+
+export function compileRosterToGlossary(
+  roster: CharacterRosterStore | null | undefined,
+  options?: { skipKanaIdentityAliases?: boolean }
+): Record<string, string> {
+  if (!roster || roster.status !== 'locked' || !Array.isArray(roster.characters)) {
+    return {};
+  }
+  const skipKanaIdentity = Boolean(options?.skipKanaIdentityAliases);
+  const out: Record<string, string> = {};
+  for (const ch of roster.characters) {
+    const src = ch.sourceName.trim();
+    const tgt = ch.targetName.trim();
+    if (src && tgt) {
+      out[src] = tgt;
+    }
+    for (const alias of ch.aliases || []) {
+      const aSrc = alias.source.trim();
+      const aTgt = alias.target.trim();
+      if (!aSrc || !aTgt || aSrc in out) continue;
+      if (skipKanaIdentity && aSrc === aTgt && PURE_KANA_READING_RE.test(aTgt)) continue;
+      out[aSrc] = aTgt;
+    }
+  }
+  return out;
+}
+
 export function loadProfileMemory(workspace: string, homeDir: string | null, profile: LocalizationProfile): ProjectMemory {
   const base = loadMemory(workspace, homeDir);
   const glossary = { ...base.glossary };
@@ -440,7 +1016,31 @@ export function loadProfileMemory(workspace: string, homeDir: string | null, pro
     personaErrors.push(...parsed.errors);
   }
 
-  return { glossary, persona, lessons: base.lessons, personaErrors };
+  const roster = readCharacterRoster(workspace);
+  let characters: CharacterRosterEntry[] = [];
+  let charactersStatus: 'none' | 'draft' | 'locked' = 'none';
+  if (roster) {
+    charactersStatus = roster.status;
+    if (roster.status === 'locked') {
+      characters = roster.characters;
+      Object.assign(
+        glossary,
+        compileRosterToGlossary(roster, {
+          skipKanaIdentityAliases:
+            profile.residueCheck && profile.targetLang.toLowerCase().startsWith('zh'),
+        })
+      );
+    }
+  }
+
+  return {
+    glossary,
+    persona,
+    lessons: base.lessons,
+    personaErrors,
+    characters,
+    charactersStatus,
+  };
 }
 
 export function readiness(profile: LocalizationProfile, memory: ProjectMemory): ReadinessState {
@@ -451,8 +1051,9 @@ export function readiness(profile: LocalizationProfile, memory: ProjectMemory): 
   if (profile.requireGlossary && Object.keys(memory.glossary).length === 0) {
     reasons.push('require_glossary=true，但术语表为空。');
   }
+  const hasMemory = Object.keys(memory.glossary).length > 0 || Object.keys(memory.persona).length > 0;
   const quality: 'ok' | 'unreviewed' | 'degraded' =
-    reasons.length > 0 ? 'degraded' : Object.keys(memory.glossary).length > 0 || Object.keys(memory.persona).length > 0 ? 'ok' : 'ok';
+    reasons.length > 0 ? 'degraded' : hasMemory ? 'ok' : 'unreviewed';
   return {
     ready: reasons.length === 0,
     quality,
@@ -684,7 +1285,7 @@ export function parseKsLine(line: string): ParsedLine {
   return { locked: !full.hasText(), speaker, anchor: null, skeleton: full };
 }
 
-function tryDecode(buf: Buffer, encoding: 'utf-8' | 'shift_jis'): string | null {
+function tryDecode(buf: Buffer, encoding: 'utf-8' | 'shift_jis' | 'gbk'): string | null {
   try {
     return new TextDecoder(encoding, { fatal: true }).decode(buf);
   } catch {
@@ -695,7 +1296,7 @@ function tryDecode(buf: Buffer, encoding: 'utf-8' | 'shift_jis'): string | null 
 function hasKana(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    if ((c >= 0x3040 && c <= 0x309f) || (c >= 0x30a0 && c <= 0x30ff)) return true;
+    if ((c >= 0x3041 && c <= 0x3096) || (c >= 0x30a1 && c <= 0x30fa)) return true;
   }
   return false;
 }
@@ -729,15 +1330,31 @@ function isAsciiBuffer(buf: Buffer): boolean {
 export function detectEncoding(data: Buffer): string {
   if (data.length === 0) return 'utf-8';
   if (data.subarray(0, 3).equals(UTF8_BOM)) return 'utf-8-bom';
+  if (data.length >= 2 && data.subarray(0, 2).equals(UTF16LE_BOM) && (data.length - 2) % 2 === 0) {
+    return 'utf-16le-bom';
+  }
+  if (isAsciiBuffer(data)) return 'utf-8';
   const utf8 = tryDecode(data, 'utf-8');
   const cp932 = tryDecode(data, 'shift_jis');
-  if (utf8 !== null && cp932 === null) return 'utf-8';
-  if (cp932 !== null && utf8 === null) return 'cp932';
-  if (utf8 === null) throw new DecodeError('unknown');
-  if (isAsciiBuffer(data) || hasKana(utf8) || cjkScore(utf8) >= cjkScore(cp932!)) {
-    return 'utf-8';
+  const gbk = tryDecode(data, 'gbk');
+
+  if (utf8 !== null) {
+    if (cp932 === null && gbk === null) return 'utf-8';
+    const utfScore = cjkScore(utf8);
+    const maxLegacyScore = Math.max(cp932 !== null ? cjkScore(cp932) : -1, gbk !== null ? cjkScore(gbk) : -1);
+    if (hasKana(utf8) || utfScore >= maxLegacyScore) {
+      return 'utf-8';
+    }
   }
-  return 'cp932';
+
+  if (cp932 !== null && gbk === null) return 'cp932';
+  if (gbk !== null && cp932 === null) return 'gbk';
+  if (cp932 !== null && gbk !== null) {
+    if (hasKana(cp932)) return 'cp932';
+    if (cjkScore(gbk) > cjkScore(cp932)) return 'gbk';
+    return 'cp932';
+  }
+  throw new DecodeError('unknown');
 }
 
 export function decodeBytes(data: Buffer, encoding?: string | null): { text: string; encoding: string } {
@@ -759,13 +1376,18 @@ export function decodeBytes(data: Buffer, encoding?: string | null): { text: str
     if (text === null) throw new DecodeError(chosen);
     return { text, encoding: 'cp932' };
   }
+  if (chosen === 'utf-16le-bom' || chosen === 'utf-16' || chosen === 'utf16') {
+    const slice = data.subarray(0, 2).equals(UTF16LE_BOM) ? data.subarray(2) : data;
+    return { text: slice.toString('utf16le'), encoding: 'utf-16le-bom' };
+  }
   if (chosen === 'utf-16le' || chosen === 'utf16le') {
     const slice = data.subarray(0, 2).equals(UTF16LE_BOM) ? data.subarray(2) : data;
     return { text: slice.toString('utf16le'), encoding: 'utf-16le' };
   }
+  const isGbk = chosen === 'gbk' || chosen === 'cp936' || chosen === 'gb2312';
   try {
-    const text = new TextDecoder(chosen, { fatal: true }).decode(data);
-    return { text, encoding: chosen };
+    const text = new TextDecoder(isGbk ? 'gbk' : chosen, { fatal: true }).decode(data);
+    return { text, encoding: isGbk ? 'gbk' : chosen };
   } catch {
     throw new DecodeError(chosen);
   }
@@ -807,14 +1429,131 @@ function getCp932EncodeMap(): Map<string, number[]> {
   return map;
 }
 
-export function normalizeEncodingName(value?: string | null): string | null {
+const GBK_COMPAT_FALLBACK: Record<string, string> = {
+  '\u301C': '\uFF5E', // 〜 -> ～
+  '\u30FB': '\u00B7', // ・ -> ·
+  '\u266A': '\u2606', // ♪ -> ☆
+  '\u2661': '\u2606', // ♡ -> ☆
+  '\u2665': '\u2605', // ♥ -> ★
+};
+
+export function normalizeGbkCompatText(text: string): string {
+  if (!text) return text;
+  let changed = false;
+  let out = '';
+  for (const ch of text) {
+    const mapped = GBK_COMPAT_FALLBACK[ch];
+    if (mapped) {
+      out += mapped;
+      changed = true;
+    } else {
+      out += ch;
+    }
+  }
+  return changed ? out : text;
+}
+
+let gbkReverseMap: Map<string, number[]> | null = null;
+function getGbkEncodeMap(): Map<string, number[]> {
+  if (gbkReverseMap) return gbkReverseMap;
+  const map = new Map<string, number[]>();
+  const dec = new TextDecoder('gbk', { fatal: true });
+  const euro = Buffer.from([0x80]);
+  try {
+    const ch = dec.decode(euro);
+    if (!map.has(ch)) map.set(ch, [0x80]);
+  } catch {
+    // ignore
+  }
+  const dbl = Buffer.alloc(2);
+  for (let b1 = 0x81; b1 <= 0xfe; b1++) {
+    dbl[0] = b1;
+    for (let b2 = 0x40; b2 <= 0xfe; b2++) {
+      if (b2 === 0x7f) continue;
+      dbl[1] = b2;
+      try {
+        const ch = dec.decode(dbl);
+        if (!map.has(ch)) map.set(ch, [b1, b2]);
+      } catch {
+        // ignore unmapped
+      }
+    }
+  }
+  gbkReverseMap = map;
+  return map;
+}
+
+function encodeDoubleByteText(
+  text: string,
+  encoding: string,
+  rev: Map<string, number[]>,
+  fallback?: Record<string, string>
+): Buffer {
+  const out: number[] = [];
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (code <= 0x7f) {
+      out.push(code);
+      continue;
+    }
+    const mapped = rev.get(ch) ?? (fallback?.[ch] ? rev.get(fallback[ch]) : undefined);
+    if (!mapped) {
+      throw new EncodeError(encoding, `无法编码字符 U+${code.toString(16).toUpperCase().padStart(4, '0')} (${ch})`);
+    }
+    for (const byte of mapped) out.push(byte);
+  }
+  return Buffer.from(out);
+}
+
+const SAFE_CUSTOM_ENCODING_BARE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+const SAFE_CUSTOM_ENCODING_PREFIXED_RE = /^custom:[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+export function isSafeCustomEncodingName(value?: string | null): boolean {
+  if (!value) return false;
+  const trimmed = value.trim();
+  return SAFE_CUSTOM_ENCODING_PREFIXED_RE.test(trimmed) || SAFE_CUSTOM_ENCODING_BARE_RE.test(trimmed);
+}
+
+export function tryNormalizeBuiltinEncoding(value?: string | null): string | null {
   if (!value) return null;
   const name = value.trim().toLowerCase();
   if (!name) return null;
   if (name === 'utf-8-bom' || name === 'utf-8-sig') return 'utf-8-bom';
   if (name === 'utf-8' || name === 'utf8') return 'utf-8';
   if (name === 'cp932' || name === 'shift_jis' || name === 'shift-jis' || name === 'sjis') return 'cp932';
+  if (name === 'utf-16le-bom' || name === 'utf-16' || name === 'utf16') return 'utf-16le-bom';
   if (name === 'utf-16le' || name === 'utf16le') return 'utf-16le';
+  if (name === 'gbk' || name === 'cp936' || name === 'gb2312') return 'gbk';
+  return null;
+}
+
+export function normalizeEncodingName(
+  value?: string | null,
+  options?: { allowCustom?: boolean; allowedCustomEncodings?: readonly string[] }
+): string | null {
+  if (!value) return null;
+  const name = value.trim().toLowerCase();
+  if (!name) return null;
+  const builtin = tryNormalizeBuiltinEncoding(name);
+  if (builtin) return builtin;
+
+  if (options?.allowCustom) {
+    if (SAFE_CUSTOM_ENCODING_PREFIXED_RE.test(name)) {
+      return name;
+    }
+    const allowedSet = new Set(
+      (options.allowedCustomEncodings ?? [])
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => SAFE_CUSTOM_ENCODING_BARE_RE.test(s) || SAFE_CUSTOM_ENCODING_PREFIXED_RE.test(s))
+    );
+    if (SAFE_CUSTOM_ENCODING_BARE_RE.test(name) && allowedSet.has(name)) {
+      return name;
+    }
+    throw new Error(
+      `不支持的写回编码：${value}（技能自定义编码须使用 custom:<名称> 前缀，或在 engine.json 的 custom_encodings 中预先声明）`
+    );
+  }
+
   throw new Error(`不支持的写回编码：${value}`);
 }
 
@@ -826,23 +1565,17 @@ export function encodeText(text: string, encoding: string): Buffer {
   if (norm === 'utf-8' || norm === 'utf8') {
     return Buffer.from(text, 'utf8');
   }
+  if (norm === 'utf-16le-bom' || norm === 'utf-16' || norm === 'utf16') {
+    return Buffer.concat([UTF16LE_BOM, Buffer.from(text, 'utf16le')]);
+  }
   if (norm === 'utf-16le' || norm === 'utf16le') {
     return Buffer.from(text, 'utf16le');
   }
   if (norm === 'cp932' || norm === 'shift_jis' || norm === 'shift-jis' || norm === 'sjis') {
-    const rev = getCp932EncodeMap();
-    const out: number[] = [];
-    for (const ch of text) {
-      const code = ch.codePointAt(0)!;
-      if (code <= 0x7f) {
-        out.push(code);
-        continue;
-      }
-      const mapped = rev.get(ch);
-      if (!mapped) throw new EncodeError(encoding);
-      for (const byte of mapped) out.push(byte);
-    }
-    return Buffer.from(out);
+    return encodeDoubleByteText(text, encoding, getCp932EncodeMap());
+  }
+  if (norm === 'gbk' || norm === 'cp936' || norm === 'gb2312') {
+    return encodeDoubleByteText(text, encoding, getGbkEncodeMap(), GBK_COMPAT_FALLBACK);
   }
   throw new EncodeError(encoding);
 }

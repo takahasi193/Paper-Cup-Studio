@@ -2,8 +2,6 @@ import * as React from 'react';
 import { AlertCircle, Check, Copy } from 'lucide-react';
 import { cn } from '@/lib/utils.js';
 
-let lastCopyAnnouncement = '';
-
 function legacyCopyText(text: string): boolean {
   if (typeof document === 'undefined') return false;
   const field = document.createElement('textarea');
@@ -40,6 +38,7 @@ export function CopyButton({
   const [copyState, setCopyState] = React.useState<'idle' | 'copied' | 'failed'>('idle');
   const [tipText, setTipText] = React.useState('');
   const timerRef = React.useRef<number | null>(null);
+  const lastAnnouncementRef = React.useRef('');
 
   React.useEffect(() => {
     return () => {
@@ -54,10 +53,10 @@ export function CopyButton({
       window.clearTimeout(timerRef.current);
     }
     let msg = ok ? '已复制' : '复制失败';
-    if (msg === lastCopyAnnouncement) {
+    if (msg === lastAnnouncementRef.current) {
       msg += '\u00A0';
     }
-    lastCopyAnnouncement = msg;
+    lastAnnouncementRef.current = msg;
 
     setCopyState(ok ? 'copied' : 'failed');
     setTipText('');

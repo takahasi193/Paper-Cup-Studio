@@ -10,9 +10,35 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 const SERVER_DIR = path.join(ROOT_DIR, 'server');
 const WEB_DIR = path.join(ROOT_DIR, 'web');
 
+export function readAppVersion(rootDir = ROOT_DIR) {
+  try {
+    const raw = fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.version === 'string' && parsed.version.trim()) {
+      return parsed.version.trim();
+    }
+  } catch {
+    // Fallback if root package.json is unavailable
+  }
+  return '0.0.0-dev';
+}
+
+export function parsePortValue(raw, sourceLabel) {
+  const str = String(raw ?? '').trim();
+  if (!/^\d+$/.test(str)) {
+    throw new Error(`无效端口 (${sourceLabel}): "${raw}"，需为 1–65535 之间的整数。`);
+  }
+  const port = Number(str);
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536) {
+    throw new Error(`端口超出范围 (${sourceLabel}): ${port}，需为 1–65535 之间的整数。`);
+  }
+  return port;
+}
+
 function printHelp() {
+  const version = readAppVersion();
   console.log(`
-Paper Cup Studio 快速启动器 (v0.1.0-beta.1)
+Paper Cup Studio 快速启动器 (v${version})
 
 用法:
   node scripts/start.mjs [选项]
@@ -27,13 +53,15 @@ Paper Cup Studio 快速启动器 (v0.1.0-beta.1)
 `);
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv, env = process.env) {
   const opts = {
     dev: false,
     rebuild: false,
     open: true,
-    port: Number(process.env.PORT || 3100),
-    workspace: process.env.PAPERCUP_WORKSPACE || '',
+    port: env.PORT !== undefined && String(env.PORT).trim() !== ''
+      ? parsePortValue(env.PORT, 'PORT')
+      : 3100,
+    workspace: env.PAPERCUP_WORKSPACE || '',
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -48,11 +76,12 @@ function parseArgs(argv) {
     } else if (arg === '--no-open') {
       opts.open = false;
     } else if (arg.startsWith('--port=')) {
-      const p = Number(arg.slice('--port='.length));
-      if (Number.isInteger(p) && p > 0 && p < 65536) opts.port = p;
-    } else if (arg === '--port' && argv[i + 1]) {
-      const p = Number(argv[++i]);
-      if (Number.isInteger(p) && p > 0 && p < 65536) opts.port = p;
+      opts.port = parsePortValue(arg.slice('--port='.length), '--port');
+    } else if (arg === '--port') {
+      if (!argv[i + 1]) {
+        throw new Error('缺少 --port 参数值。');
+      }
+      opts.port = parsePortValue(argv[++i], '--port');
     } else if (arg.startsWith('--workspace=')) {
       opts.workspace = arg.slice('--workspace='.length);
     } else if (arg === '--workspace' && argv[i + 1]) {
@@ -87,6 +116,60 @@ function hasBin(dir, name) {
   return fs.existsSync(path.join(binDir, process.platform === 'win32' ? `${name}.cmd` : name));
 }
 
+function getLatestMtimeMs(targetPath) {
+  let maxMtime = 0;
+  let stat;
+  try {
+    stat = fs.statSync(targetPath);
+  } catch {
+    return 0;
+  }
+  if (!stat.isDirectory()) {
+    return stat.mtimeMs;
+  }
+  const stack = [targetPath];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(full);
+          if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
+        } catch {
+          // Ignore transient unreadable file
+        }
+      }
+    }
+  }
+  return maxMtime;
+}
+
+export function isBuildStale(distEntry, inputPaths) {
+  let distStat;
+  try {
+    distStat = fs.statSync(distEntry);
+  } catch {
+    return true;
+  }
+  const distMtime = distStat.mtimeMs;
+  for (const input of inputPaths) {
+    if (getLatestMtimeMs(input) > distMtime) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function runSyncStep(label, args, cwd) {
   console.log(`[Paper Cup] ${label}...`);
   const res = spawnSync(npmCmd(), args, {
@@ -99,9 +182,10 @@ function runSyncStep(label, args, cwd) {
   }
 }
 
-async function waitForUrl(url, timeoutMs = 45000) {
+async function waitForUrl(url, timeoutMs = 45000, shouldAbort = () => false) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (shouldAbort()) return false;
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
       if (res.ok) return true;
@@ -111,6 +195,19 @@ async function waitForUrl(url, timeoutMs = 45000) {
     await new Promise((r) => setTimeout(r, 350));
   }
   return false;
+}
+
+function killProcessTree(child) {
+  if (!child || child.exitCode !== null || !child.pid) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      child.kill('SIGTERM');
+    }
+  } catch {
+    // Ignore exit races
+  }
 }
 
 function openBrowser(url) {
@@ -136,8 +233,22 @@ async function main() {
 
   const serverEntry = path.join(SERVER_DIR, 'dist', 'index.js');
   const webEntry = path.join(WEB_DIR, 'dist', 'index.html');
-  const needServerBuildDeps = opts.dev || opts.rebuild || !fs.existsSync(serverEntry);
-  const needWebDeps = opts.dev || opts.rebuild || !fs.existsSync(webEntry);
+  const serverBuildInputs = [
+    path.join(SERVER_DIR, 'src'),
+    path.join(SERVER_DIR, 'package.json'),
+    path.join(SERVER_DIR, 'tsconfig.json'),
+  ];
+  const webBuildInputs = [
+    path.join(WEB_DIR, 'src'),
+    path.join(WEB_DIR, 'index.html'),
+    path.join(WEB_DIR, 'vite.config.ts'),
+    path.join(WEB_DIR, 'package.json'),
+    path.join(WEB_DIR, 'tsconfig.json'),
+  ];
+  const serverNeedsBuild = !opts.dev && (opts.rebuild || isBuildStale(serverEntry, serverBuildInputs));
+  const webNeedsBuild = !opts.dev && (opts.rebuild || isBuildStale(webEntry, webBuildInputs));
+  const needServerBuildDeps = opts.dev || serverNeedsBuild;
+  const needWebDeps = opts.dev || webNeedsBuild;
 
   if (
     needServerBuildDeps
@@ -165,11 +276,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     for (const child of children) {
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // Ignore exit races
-      }
+      killProcessTree(child);
     }
   };
 
@@ -180,6 +287,9 @@ async function main() {
   process.on('SIGTERM', () => {
     cleanup();
     process.exit(0);
+  });
+  process.on('exit', () => {
+    cleanup();
   });
 
   if (opts.dev) {
@@ -211,24 +321,35 @@ async function main() {
       }
     });
 
-    const healthUrl = `http://127.0.0.1:${opts.port}/health`;
+    const healthUrl = `http://${sharedEnv.HOST}:${opts.port}/health`;
     const devUrl = 'http://localhost:5173/';
-    const [okApi, okWeb] = await Promise.all([waitForUrl(healthUrl), waitForUrl(devUrl)]);
-    if (okApi && okWeb) {
-      console.log(`\n[Paper Cup] 开发工作台已就绪：${devUrl} (按 Ctrl+C 停止)\n`);
-      if (opts.open) openBrowser(devUrl);
+    const [okApi, okWeb] = await Promise.all([
+      waitForUrl(healthUrl, 45000, () => shuttingDown),
+      waitForUrl(devUrl, 45000, () => shuttingDown),
+    ]);
+    if (!okApi || !okWeb) {
+      const failed = [
+        !okApi ? `服务端 (${healthUrl})` : null,
+        !okWeb ? `前端开发服务器 (${devUrl})` : null,
+      ]
+        .filter(Boolean)
+        .join('、');
+      cleanup();
+      throw new Error(`等待服务就绪超时 (45s)：${failed} 未响应，已终止子进程。`);
     }
+    console.log(`\n[Paper Cup] 开发工作台已就绪：${devUrl} (按 Ctrl+C 停止)\n`);
+    if (opts.open) openBrowser(devUrl);
     return;
   }
 
-  if (opts.rebuild || !fs.existsSync(serverEntry)) {
+  if (serverNeedsBuild) {
     runSyncStep('编译服务端 (server)', ['run', 'build'], SERVER_DIR);
   }
-  if (opts.rebuild || !fs.existsSync(webEntry)) {
+  if (webNeedsBuild) {
     runSyncStep('构建前端静态资源 (web)', ['run', 'build'], WEB_DIR);
   }
 
-  console.log(`[Paper Cup] 启动单端口整合服务 (http://127.0.0.1:${opts.port}/)...`);
+  console.log(`[Paper Cup] 启动单端口整合服务 (http://${sharedEnv.HOST}:${opts.port}/)...`);
   const serverProc = spawn(process.execPath, [serverEntry], {
     cwd: ROOT_DIR,
     env: sharedEnv,
@@ -242,15 +363,29 @@ async function main() {
     }
   });
 
-  const targetUrl = `http://127.0.0.1:${opts.port}/`;
-  const ready = await waitForUrl(`http://127.0.0.1:${opts.port}/health`);
-  if (ready) {
-    console.log(`\n[Paper Cup] 已启动：${targetUrl} (按 Ctrl+C 停止)\n`);
-    if (opts.open) openBrowser(targetUrl);
+  const targetUrl = `http://${sharedEnv.HOST}:${opts.port}/`;
+  const healthUrl = `http://${sharedEnv.HOST}:${opts.port}/health`;
+  const ready = await waitForUrl(healthUrl, 45000, () => shuttingDown);
+  if (!ready) {
+    cleanup();
+    throw new Error(`等待服务端就绪超时 (45s)：${healthUrl} 未响应，已终止子进程。`);
+  }
+  console.log(`\n[Paper Cup] 已启动：${targetUrl} (按 Ctrl+C 停止)\n`);
+  if (opts.open) openBrowser(targetUrl);
+}
+
+function isDirectEntry() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+  } catch {
+    return path.resolve(process.argv[1]) === path.resolve(__filename);
   }
 }
 
-main().catch((err) => {
-  console.error('[Paper Cup] 启动失败:', err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+if (isDirectEntry()) {
+  main().catch((err) => {
+    console.error('[Paper Cup] 启动失败:', err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}

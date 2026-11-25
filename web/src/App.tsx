@@ -1,10 +1,11 @@
 import * as React from 'react';
 import { ArrowDown } from 'lucide-react';
-import { Composer } from '@/components/chat/Composer.js';
+import { PixelCupLoader } from '@/components/brand/PixelCupLoader.js';
+import { Composer, DraftInjectionRequest } from '@/components/chat/Composer.js';
 import { EmptyState } from '@/components/chat/EmptyState.js';
 import { MessageItem } from '@/components/chat/MessageItem.js';
+import { PendingQueueTimingHint } from '@/components/chat/PendingQueueTray.js';
 import { ApiKeyDialog } from '@/components/dialogs/ApiKeyDialog.js';
-import { CommandPalette } from '@/components/dialogs/CommandPalette.js';
 import { ConfirmDialog } from '@/components/dialogs/ConfirmDialog.js';
 import { SettingsDialog } from '@/components/dialogs/SettingsDialog.js';
 import { WorkspaceDialog } from '@/components/dialogs/WorkspaceDialog.js';
@@ -13,32 +14,49 @@ import { OtherWorkspaceSessionsState, Sidebar } from '@/components/layout/Sideba
 import { TopBar } from '@/components/layout/TopBar.js';
 import { SubagentTaskView } from '@/components/subagent/SubagentTaskView.js';
 import { Drawer } from '@/components/ui/Drawer.js';
+import { ToastItem, ToastRegion } from '@/components/ui/ToastRegion.js';
 import { useAmbientMotion } from '@/hooks/useAmbientMotion.js';
-import { ChatMessage, useAgentStream } from '@/hooks/useAgentStream.js';
+import { ChatMessage, CompactionEndEvent, useAgentStream } from '@/hooks/useAgentStream.js';
 import { useColorScheme } from '@/hooks/useColorScheme.js';
 import { useMediaQuery } from '@/hooks/useMediaQuery.js';
 import {
+  abortSubagentTask,
   abortTurn,
+  ApiRequestError,
+  cancelChatFormRequest,
+  ChatImageAttachment,
+  clearTurnQueue,
+  compactSession,
   deleteSession,
   EngineeringStatus,
+  enqueueTurnMessage,
   fetchEngineeringStatus,
   fetchModels,
   fetchSessionHistory,
+  fetchTranslatorConfig,
   fetchWorkspaces,
   fetchWorkspaceSessions,
   ModelOption,
   ModelsState,
   openWorkspaceSession,
-  pickWorkspaceFolder,
   ProviderStatusInfo,
+  QueuedMessageItem,
+  QueuedMessageMode,
+  removeTurnQueueItem,
   resetSession,
+  resolveEngineDisplay,
+  RestoredDraftPayload,
   selectModel,
   selectSession,
   selectWorkspace,
   SessionHistoryState,
   SessionSummary,
   startTurn,
+  submitChatForm,
+  SubmitChatFormItemPayload,
+  switchTurnQueueItemMode,
   ThinkingLevel,
+  TranslatorConfigState,
   updateThinkingLevel,
 } from '@/lib/api.js';
 import { getActiveSubagentRoles } from '@/lib/toolLabels.js';
@@ -66,12 +84,8 @@ function readSidebarPinned(): boolean {
   }
 }
 
-function extractEngineLabel(status: EngineeringStatus | null): string | null {
-  const first = (status?.engine || '').trim().split(/\r?\n/)[0] || '';
-  if (!first || first.includes('未识别') || first.toLowerCase().startsWith('unknown')) {
-    return null;
-  }
-  return first.split(/\s+/)[0] || first;
+function isAbortError(err: unknown): boolean {
+  return Boolean(err && typeof err === 'object' && (err as { name?: string }).name === 'AbortError');
 }
 
 export function App() {
@@ -87,16 +101,33 @@ export function App() {
   const [thinkingLevel, setThinkingLevel] = React.useState<ThinkingLevel>('low');
   const [availableThinkingLevels, setAvailableThinkingLevels] = React.useState<ThinkingLevel[]>([]);
   const [isSwitchingThinking, setIsSwitchingThinking] = React.useState(false);
+  const [translatorConfig, setTranslatorConfig] = React.useState<TranslatorConfigState | null>(null);
 
   const [isEngineeringPinned, setIsEngineeringPinned] = React.useState(readEngineeringPinned);
   const [isEngineeringDrawerOpen, setIsEngineeringDrawerOpen] = React.useState(false);
   const [isSidebarPinned, setIsSidebarPinned] = React.useState(readSidebarPinned);
   const [isSidebarDrawerOpen, setIsSidebarDrawerOpen] = React.useState(false);
-  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = React.useState(false);
   const [isSwitcherOpen, setIsSwitcherOpen] = React.useState(false);
   const [isApiKeyModalOpen, setIsApiKeyModalOpen] = React.useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
   const [pendingDeleteSession, setPendingDeleteSession] = React.useState<SessionSummary | null>(null);
+  const [toasts, setToasts] = React.useState<ToastItem[]>([]);
+  const toastSeqRef = React.useRef(0);
+
+  const pushToast = React.useCallback((toast: Omit<ToastItem, 'id'>) => {
+    const id = `toast-${Date.now()}-${++toastSeqRef.current}`;
+    setToasts((prev) => [...prev.slice(-2), { ...toast, id }]);
+  }, []);
+
+  const dismissToast = React.useCallback((id: string) => {
+    setToasts((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const isAnyModalOpen =
+    isSettingsOpen ||
+    isSwitcherOpen ||
+    isApiKeyModalOpen ||
+    Boolean(pendingDeleteSession);
   const [isAtBottom, setIsAtBottom] = React.useState(true);
   const [hasUnreadStreamUpdate, setHasUnreadStreamUpdate] = React.useState(false);
   const [activeSubagentView, setActiveSubagentView] = React.useState<{
@@ -148,36 +179,167 @@ export function App() {
     }
   }, []);
 
+  const activeWorkspaceRef = React.useRef(activeWorkspace);
+  activeWorkspaceRef.current = activeWorkspace;
+  const workspaceFetchEpochRef = React.useRef(0);
+  const workspaceFetchAbortRef = React.useRef<AbortController | null>(null);
+  const engineeringReqSeqRef = React.useRef(0);
+  const otherWorkspaceSessionsRef = React.useRef(otherWorkspaceSessions);
+  otherWorkspaceSessionsRef.current = otherWorkspaceSessions;
+  const inFlightOtherWsRef = React.useRef<Set<string>>(new Set());
+
+  const refreshEngineeringStatus = React.useCallback((forceRefresh = false) => {
+    const epoch = workspaceFetchEpochRef.current;
+    const reqSeq = ++engineeringReqSeqRef.current;
+    return fetchEngineeringStatus(forceRefresh)
+      .then((status) => {
+        if (workspaceFetchEpochRef.current !== epoch || engineeringReqSeqRef.current !== reqSeq) {
+          return;
+        }
+        setEngineeringStatus(status);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) {
+          console.error('Failed to load engineering status:', err);
+        }
+      });
+  }, []);
+
   const hydrateFromReconnectRef = React.useRef<() => void>(() => {});
+  const loadWorkspaceDataRef = React.useRef<(forceRefreshEngineering?: boolean) => void>(() => {});
   const handleStreamReconnect = React.useCallback(() => {
     hydrateFromReconnectRef.current();
   }, []);
   const handleBatchProgress = React.useCallback(() => {
-    fetchEngineeringStatus().then(setEngineeringStatus).catch(console.error);
+    void refreshEngineeringStatus(false);
+  }, [refreshEngineeringStatus]);
+  const handleSkillsUpdated = React.useCallback(
+    (skills: string[]) => {
+      setEngineeringStatus((prev) => (prev ? { ...prev, skills } : prev));
+      void refreshEngineeringStatus(true);
+    },
+    [refreshEngineeringStatus]
+  );
+  const handleSmokeConfigUpdated = React.useCallback(() => {
+    void refreshEngineeringStatus(true);
+  }, [refreshEngineeringStatus]);
+  const handleExternalWorkspaceChanged = React.useCallback((workspace: string) => {
+    if (workspace.trim().toLowerCase() !== activeWorkspaceRef.current.trim().toLowerCase()) {
+      setActiveSubagentView(null);
+      loadWorkspaceDataRef.current(true);
+    }
   }, []);
+  const handleSessionReady = React.useCallback((sid: string | null) => {
+    if (sid) {
+      setActiveSessionId((prev) => prev ?? sid);
+    }
+  }, []);
+  const handleCompactionEnd = React.useCallback(
+    (ev: CompactionEndEvent) => {
+      if (ev.status === 'error' && ev.error && ev.reason !== 'manual') {
+        pushToast({
+          tone: 'warning',
+          title: '上下文压缩失败',
+          message: ev.error,
+          durationMs: 5200,
+        });
+      }
+    },
+    [pushToast]
+  );
 
   const {
     messages,
     isStreaming,
     isThinking,
+    isCompacting,
+    queuedCompaction,
+    setQueuedCompaction,
     turnPhase,
     retryInfo,
     currentThinking,
     currentResponse,
     currentTools,
+    pendingQueue,
+    setPendingQueue,
+    lastRestoredDraft,
     subagentTasks,
+    activeDirectSubagentTaskId,
     activeModel,
     latestThinkingLevel,
     latestModelsState,
+    latestTranslatorConfig,
+    latestSmokeConfig,
+    translatorSyncStatus,
     latestSessionState,
     latestSessionsList,
+    tokenUsage,
+    applyTokenUsage,
+    chatForms,
+    upsertChatForm,
+    appendCompactionResult,
     hydrateSessionState,
+    subscribeSubagentStream,
+    subscribeSubagentQueue,
+    subscribeSubagentQueueRestored,
     addUserMessage,
+    removeMessage,
     addErrorMessage,
   } = useAgentStream({
     onReconnect: handleStreamReconnect,
     onBatchProgress: handleBatchProgress,
+    onSkillsUpdated: handleSkillsUpdated,
+    onSmokeConfigUpdated: handleSmokeConfigUpdated,
+    onWorkspaceChanged: handleExternalWorkspaceChanged,
+    onSessionReady: handleSessionReady,
+    onCompactionEnd: handleCompactionEnd,
   });
+
+  const [mainQueueBusyItemId, setMainQueueBusyItemId] = React.useState<string | null>(null);
+  const [mainQueueClearing, setMainQueueClearing] = React.useState(false);
+  const [mainQueueAnnouncement, setMainQueueAnnouncement] = React.useState('');
+  const [mainDraftInjection, setMainDraftInjection] = React.useState<DraftInjectionRequest | null>(
+    null
+  );
+  const handledMainRestoreIdsRef = React.useRef<Set<string>>(new Set());
+
+  const applyMainRestoredDraft = React.useCallback(
+    (
+      restored: RestoredDraftPayload | null | undefined,
+      reason: 'aborted' | 'error' | 'cleared' = 'aborted'
+    ) => {
+      if (!restored?.text?.trim()) return;
+      if (handledMainRestoreIdsRef.current.has(restored.restoreId)) return;
+      handledMainRestoreIdsRef.current.add(restored.restoreId);
+      if (handledMainRestoreIdsRef.current.size > 40) {
+        const first = handledMainRestoreIdsRef.current.values().next().value;
+        if (first) handledMainRestoreIdsRef.current.delete(first);
+      }
+      setMainDraftInjection({ id: restored.restoreId, text: restored.text });
+      const dropHint =
+        restored.droppedFollowUpCount > 0
+          ? `（已舍弃其余 ${restored.droppedFollowUpCount} 条后续排队）`
+          : '';
+      const message =
+        reason === 'cleared'
+          ? `已清空队列并将消息恢复到输入框${dropHint}`
+          : `已将未送达消息恢复到输入框${dropHint}`;
+      setMainQueueAnnouncement(message);
+      pushToast({
+        tone: 'info',
+        title: '未送达指令已回填输入框',
+        message,
+        durationMs: 5200,
+      });
+    },
+    [pushToast]
+  );
+
+  React.useEffect(() => {
+    if (lastRestoredDraft) {
+      applyMainRestoredDraft(lastRestoredDraft);
+    }
+  }, [lastRestoredDraft, applyMainRestoredDraft]);
 
   const applySessionState = React.useCallback(
     (state: SessionHistoryState) => {
@@ -193,10 +355,55 @@ export function App() {
     [hydrateSessionState]
   );
 
+  const beginWorkspaceFetchBatch = React.useCallback(() => {
+    workspaceFetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    workspaceFetchAbortRef.current = controller;
+    const epoch = ++workspaceFetchEpochRef.current;
+    engineeringReqSeqRef.current += 1;
+    return { epoch, signal: controller.signal };
+  }, []);
+
+  React.useEffect(() => {
+    return () => {
+      workspaceFetchAbortRef.current?.abort();
+    };
+  }, []);
+
   hydrateFromReconnectRef.current = () => {
-    fetchSessionHistory().then(applySessionState).catch(console.error);
-    fetchModels().then(applyModelsState).catch(console.error);
-    fetchEngineeringStatus().then(setEngineeringStatus).catch(console.error);
+    const { epoch, signal } = beginWorkspaceFetchBatch();
+    fetchSessionHistory(signal)
+      .then((state) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        applySessionState(state);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchModels(signal)
+      .then((state) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        applyModelsState(state);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchTranslatorConfig(signal)
+      .then((cfg) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        setTranslatorConfig(cfg);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchEngineeringStatus(false, signal)
+      .then((status) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        setEngineeringStatus(status);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
   };
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -204,35 +411,57 @@ export function App() {
 
   const loadWorkspaceData = React.useCallback(
     (forceRefreshEngineering = false) => {
-      fetchWorkspaces()
+      const { epoch, signal } = beginWorkspaceFetchBatch();
+
+      fetchWorkspaces(signal)
         .then((ws) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
           setActiveWorkspace(ws.active);
           setRecentWorkspaces(ws.recent || [ws.active]);
         })
         .catch((err) => {
-          console.error('Failed to load workspaces:', err);
+          if (!isAbortError(err)) console.error('Failed to load workspaces:', err);
         });
 
-      fetchSessionHistory()
-        .then(applySessionState)
+      fetchSessionHistory(signal)
+        .then((state) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          applySessionState(state);
+        })
         .catch((err) => {
-          console.error('Failed to load session history:', err);
+          if (!isAbortError(err)) console.error('Failed to load session history:', err);
         });
 
-      fetchModels()
-        .then(applyModelsState)
+      fetchModels(signal)
+        .then((state) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          applyModelsState(state);
+        })
         .catch((err) => {
-          console.error('Failed to load models:', err);
+          if (!isAbortError(err)) console.error('Failed to load models:', err);
         });
 
-      fetchEngineeringStatus(forceRefreshEngineering)
-        .then(setEngineeringStatus)
+      fetchTranslatorConfig(signal)
+        .then((cfg) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          setTranslatorConfig(cfg);
+        })
         .catch((err) => {
-          console.error('Failed to load engineering status:', err);
+          if (!isAbortError(err)) console.error('Failed to load translator config:', err);
+        });
+
+      fetchEngineeringStatus(forceRefreshEngineering, signal)
+        .then((status) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          setEngineeringStatus(status);
+        })
+        .catch((err) => {
+          if (!isAbortError(err)) console.error('Failed to load engineering status:', err);
         });
     },
-    [applyModelsState, applySessionState]
+    [applyModelsState, applySessionState, beginWorkspaceFetchBatch]
   );
+  loadWorkspaceDataRef.current = loadWorkspaceData;
 
   React.useEffect(() => {
     setSelectedModel(activeModel);
@@ -247,16 +476,66 @@ export function App() {
   const wasStreamingRef = React.useRef(false);
   React.useEffect(() => {
     if (wasStreamingRef.current && !isStreaming) {
-      fetchEngineeringStatus().then(setEngineeringStatus).catch(console.error);
+      void refreshEngineeringStatus(false);
     }
     wasStreamingRef.current = isStreaming;
-  }, [isStreaming]);
+  }, [isStreaming, refreshEngineeringStatus]);
 
   React.useEffect(() => {
     if (latestModelsState) {
       applyModelsState(latestModelsState);
     }
   }, [latestModelsState, applyModelsState]);
+
+  const seenSyncSeqsRef = React.useRef<Set<number>>(new Set());
+
+  const markSyncSeqHandled = React.useCallback((seq: number | undefined) => {
+    if (typeof seq !== 'number' || !Number.isFinite(seq)) return;
+    seenSyncSeqsRef.current.add(seq);
+    if (seenSyncSeqsRef.current.size > 60) {
+      const first = seenSyncSeqsRef.current.values().next().value;
+      if (first !== undefined) seenSyncSeqsRef.current.delete(first);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (latestTranslatorConfig) {
+      setTranslatorConfig(latestTranslatorConfig);
+    }
+  }, [latestTranslatorConfig]);
+
+  React.useEffect(() => {
+    if (!translatorSyncStatus) return;
+    if (translatorSyncStatus.seq !== undefined) {
+      if (seenSyncSeqsRef.current.has(translatorSyncStatus.seq)) {
+        return;
+      }
+      markSyncSeqHandled(translatorSyncStatus.seq);
+    }
+    if (translatorSyncStatus.phase === 'ready' || translatorSyncStatus.phase === 'error') {
+      void refreshEngineeringStatus(true);
+    }
+    if (isSettingsOpen || translatorSyncStatus.status === 'skipped') return;
+
+    if (
+      translatorSyncStatus.phase === 'ready' &&
+      (translatorSyncStatus.status === 'started' || translatorSyncStatus.status === 'restarted')
+    ) {
+      pushToast({
+        tone: 'success',
+        title: 'Ollama 后台服务已就绪',
+        message: translatorSyncStatus.message,
+        durationMs: 7500,
+      });
+    } else if (translatorSyncStatus.phase === 'error') {
+      pushToast({
+        tone: 'warning',
+        title: '本机 Ollama 自动拉起未完成',
+        message: translatorSyncStatus.message,
+        durationMs: 7500,
+      });
+    }
+  }, [translatorSyncStatus, isSettingsOpen, markSyncSeqHandled, pushToast, refreshEngineeringStatus]);
 
   React.useEffect(() => {
     if (latestSessionState) {
@@ -314,70 +593,121 @@ export function App() {
   }, []);
 
   const handleWorkspaceChanged = (newActive: string, recent: string[]) => {
+    const { epoch, signal } = beginWorkspaceFetchBatch();
     setActiveWorkspace(newActive);
     setRecentWorkspaces(recent);
     setActiveSubagentView(null);
     invalidateOtherWorkspaceCache(newActive);
-    fetchEngineeringStatus().then(setEngineeringStatus).catch(console.error);
-    fetchSessionHistory().then(applySessionState).catch(console.error);
-    fetchModels().then(applyModelsState).catch(console.error);
+    fetchEngineeringStatus(false, signal)
+      .then((status) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        setEngineeringStatus(status);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchSessionHistory(signal)
+      .then((state) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        applySessionState(state);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchModels(signal)
+      .then((state) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        applyModelsState(state);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
+    fetchTranslatorConfig(signal)
+      .then((cfg) => {
+        if (workspaceFetchEpochRef.current !== epoch) return;
+        setTranslatorConfig(cfg);
+      })
+      .catch((err) => {
+        if (!isAbortError(err)) console.error(err);
+      });
   };
 
-  const handleExpandOtherWorkspace = React.useCallback(
-    (wsPath: string, force = false) => {
-      let shouldFetch = false;
-      setOtherWorkspaceSessions((prev) => {
-        const cur = prev[wsPath];
-        if (cur?.loading) return prev;
-        if (cur?.loaded && !cur.error && !force) return prev;
-        shouldFetch = true;
-        return {
+  const handleExpandOtherWorkspace = React.useCallback((wsPath: string, force = false) => {
+    const cur = otherWorkspaceSessionsRef.current[wsPath];
+    if (inFlightOtherWsRef.current.has(wsPath) || cur?.loading) return;
+    if (cur?.loaded && !cur.error && !force) return;
+
+    inFlightOtherWsRef.current.add(wsPath);
+    setOtherWorkspaceSessions((prev) => ({
+      ...prev,
+      [wsPath]: {
+        loading: true,
+        loaded: false,
+        sessions: prev[wsPath]?.sessions ?? [],
+      },
+    }));
+
+    fetchWorkspaceSessions(wsPath)
+      .then((res) => {
+        setOtherWorkspaceSessions((prev) => ({
           ...prev,
           [wsPath]: {
-            loading: true,
-            loaded: false,
-            sessions: cur?.sessions ?? [],
+            loading: false,
+            loaded: true,
+            sessions: res.sessions,
           },
-        };
+        }));
+      })
+      .catch((err) => {
+        setOtherWorkspaceSessions((prev) => ({
+          ...prev,
+          [wsPath]: {
+            loading: false,
+            loaded: false,
+            error: err instanceof Error ? err.message : '加载失败',
+            sessions: [],
+          },
+        }));
+      })
+      .finally(() => {
+        inFlightOtherWsRef.current.delete(wsPath);
       });
-      if (!shouldFetch) return;
-      fetchWorkspaceSessions(wsPath)
-        .then((res) => {
-          setOtherWorkspaceSessions((prev) => ({
-            ...prev,
-            [wsPath]: {
-              loading: false,
-              loaded: true,
-              sessions: res.sessions,
-            },
-          }));
-        })
-        .catch((err) => {
-          setOtherWorkspaceSessions((prev) => ({
-            ...prev,
-            [wsPath]: {
-              loading: false,
-              loaded: false,
-              error: err instanceof Error ? err.message : '加载失败',
-              sessions: [],
-            },
-          }));
-        });
-    },
-    []
-  );
+  }, []);
 
   const handleOpenWorkspaceSession = async (wsPath: string, sessionId: string) => {
-    if (isStreaming) return;
+    if (isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId)) return;
     try {
       const res = await openWorkspaceSession(wsPath, sessionId);
+      const { epoch, signal } = beginWorkspaceFetchBatch();
       setActiveWorkspace(res.workspaces.active);
       setRecentWorkspaces(res.workspaces.recent || [res.workspaces.active]);
       setActiveSubagentView(null);
       invalidateOtherWorkspaceCache(res.workspaces.active);
       applySessionState(res.session);
-      fetchEngineeringStatus().then(setEngineeringStatus).catch(console.error);
-      fetchModels().then(applyModelsState).catch(console.error);
+      fetchEngineeringStatus(false, signal)
+        .then((status) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          setEngineeringStatus(status);
+        })
+        .catch((err) => {
+          if (!isAbortError(err)) console.error(err);
+        });
+      fetchModels(signal)
+        .then((state) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          applyModelsState(state);
+        })
+        .catch((err) => {
+          if (!isAbortError(err)) console.error(err);
+        });
+      fetchTranslatorConfig(signal)
+        .then((cfg) => {
+          if (workspaceFetchEpochRef.current !== epoch) return;
+          setTranslatorConfig(cfg);
+        })
+        .catch((err) => {
+          if (!isAbortError(err)) console.error(err);
+        });
     } catch (err) {
       console.error('Failed to open workspace session:', err);
       addErrorMessage(err instanceof Error ? err.message : '打开历史工作区对话失败');
@@ -385,7 +715,7 @@ export function App() {
   };
 
   const handleQuickSwitchWorkspace = async (wsPath: string) => {
-    if (isStreaming) return;
+    if (isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId)) return;
     try {
       const res = await selectWorkspace(wsPath);
       handleWorkspaceChanged(res.active, res.recent);
@@ -396,8 +726,9 @@ export function App() {
   };
 
   const handleNewSession = async () => {
-    if (isStreaming) return;
+    if (isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId)) return;
     try {
+      setActiveSubagentView(null);
       const fresh = await resetSession();
       applySessionState(fresh);
       if (activeWorkspace) invalidateOtherWorkspaceCache(activeWorkspace);
@@ -408,8 +739,10 @@ export function App() {
   };
 
   const handleSelectSession = async (sessionId: string) => {
-    if (isStreaming || sessionId === activeSessionId) return;
+    if (isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId)) return;
     try {
+      setActiveSubagentView(null);
+      if (sessionId === activeSessionId) return;
       const next = await selectSession(sessionId);
       applySessionState(next);
     } catch (err) {
@@ -419,7 +752,7 @@ export function App() {
   };
 
   const handleDeleteSession = async (sessionId: string) => {
-    if (isStreaming) return;
+    if (isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId)) return;
     try {
       const next = await deleteSession(sessionId);
       applySessionState(next);
@@ -468,7 +801,7 @@ export function App() {
       setHasUnreadStreamUpdate(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, currentThinking, currentResponse, currentTools]);
+  }, [messages, currentThinking, currentResponse, currentTools, isCompacting]);
 
   React.useEffect(() => {
     if (!activeSubagentView || activeSubagentView.taskId || !activeSubagentView.roleFilter) {
@@ -509,27 +842,271 @@ export function App() {
     });
   };
 
-  const handleSend = async (prompt: string) => {
+  const handleSend = async (prompt: string, images?: ChatImageAttachment[]): Promise<boolean> => {
     setActiveSubagentView(null);
-    addUserMessage(prompt);
+    const hasImages = Boolean(images && images.length > 0);
+    const optimisticText = prompt.trim() ? prompt : hasImages ? '请查看附带的图片并协助定位问题。' : prompt;
+    const optimisticMsgId = addUserMessage(optimisticText, images);
     requestAnimationFrame(() => {
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     });
     try {
-      await startTurn(prompt, selectedModel || undefined);
+      await startTurn(prompt, selectedModel || undefined, images);
+      return true;
     } catch (err) {
       console.error('Error triggering turn:', err);
-      addErrorMessage(err instanceof Error ? err.message : '无法连接服务端');
+      removeMessage(optimisticMsgId);
+      pushToast({
+        tone: 'warning',
+        title: '发送消息失败',
+        message: err instanceof Error ? err.message : '无法连接服务端',
+      });
+      return false;
+    }
+  };
+
+  const handleCompact = async (focus?: string): Promise<boolean> => {
+    setActiveSubagentView(null);
+    try {
+      const res = await compactSession(focus);
+      if (res.tokenUsage) {
+        applyTokenUsage(res.tokenUsage);
+      }
+      if (res.status === 'queued') {
+        const resolvedFocus = res.focus ?? focus;
+        setQueuedCompaction(resolvedFocus ? { focus: resolvedFocus } : {});
+        setMainQueueAnnouncement('已排队：本轮结束后压缩上下文');
+        pushToast({
+          tone: 'info',
+          title: '已排队：本轮结束后压缩上下文',
+          message: res.message || '将在当前回合完成后自动执行上下文压缩。',
+          durationMs: 4200,
+        });
+        return true;
+      }
+      if (res.status === 'noop') {
+        pushToast({
+          tone: 'info',
+          title: '当前对话较短，无需压缩',
+          message: res.message || '当前上下文较短，暂无需压缩。',
+          durationMs: 4000,
+        });
+        return true;
+      }
+      if (res.status === 'compacted' && res.result) {
+        appendCompactionResult(res.result);
+      }
+      return true;
+    } catch (err) {
+      pushToast({
+        tone: 'warning',
+        title: '压缩上下文失败',
+        message: err instanceof Error ? err.message : '操作失败',
+        durationMs: 5200,
+      });
+      return false;
+    }
+  };
+
+  const handleSubmitChatForm = React.useCallback(
+    async (
+      formId: string,
+      payload: { items: SubmitChatFormItemPayload[]; dismissedNames?: string[]; autoContinue: boolean }
+    ) => {
+      const res = await submitChatForm(formId, {
+        items: payload.items,
+        ...(payload.dismissedNames?.length ? { dismissedNames: payload.dismissedNames } : {}),
+        autoContinue: payload.autoContinue,
+        model: selectedModel || undefined,
+      });
+      upsertChatForm(res.form);
+      void refreshEngineeringStatus(false);
+
+      if (res.startedTurn && res.userPrompt) {
+        addUserMessage(res.userPrompt);
+        requestAnimationFrame(() => {
+          const el = scrollRef.current;
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+        pushToast({
+          tone: 'success',
+          title: '角色译名已锁定',
+          message: `已锁定 ${res.form.items.length} 位角色译名（同步 ${res.glossaryEntriesAdded} 条术语），正在继续翻译…`,
+        });
+      } else {
+        pushToast({
+          tone: 'success',
+          title: '角色译名已保存并锁定',
+          message: `已锁定 ${res.form.items.length} 位角色译名并同步 ${res.glossaryEntriesAdded} 条术语。`,
+        });
+      }
+    },
+    [addUserMessage, pushToast, refreshEngineeringStatus, selectedModel, upsertChatForm]
+  );
+
+  const handleCancelChatForm = React.useCallback(
+    async (formId: string) => {
+      const res = await cancelChatFormRequest(formId);
+      upsertChatForm(res.form);
+      pushToast({
+        tone: 'info',
+        title: '已取消角色确认表单',
+        message: '你可以继续在对话中指示 Paper Cup 重新整理角色表。',
+      });
+    },
+    [pushToast, upsertChatForm]
+  );
+
+  const handleQueueSend = async (
+    prompt: string,
+    mode: QueuedMessageMode,
+    images?: ChatImageAttachment[]
+  ): Promise<boolean> => {
+    try {
+      const res = await enqueueTurnMessage(prompt, mode, images);
+      setPendingQueue(res.queue);
+      setMainQueueAnnouncement(mode === 'steer' ? '已加入插话队列' : '已加入排队队列');
+      return true;
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.code === 'TURN_NOT_RUNNING' && !activeDirectSubagentTaskId) {
+        return handleSend(prompt, images);
+      }
+      pushToast({
+        tone: 'warning',
+        title: mode === 'steer' ? '发送插话失败' : '加入排队失败',
+        message: err instanceof Error ? err.message : '操作失败',
+      });
+      return false;
+    }
+  };
+
+  const handleSwitchMainQueueMode = async (item: QueuedMessageItem, nextMode: QueuedMessageMode) => {
+    setMainQueueBusyItemId(item.id);
+    try {
+      const res = await switchTurnQueueItemMode(item.id, nextMode);
+      setPendingQueue(res.queue);
+      setMainQueueAnnouncement(nextMode === 'steer' ? '已升为插话' : '已转为排队');
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.queue) {
+        setPendingQueue(err.queue);
+      }
+      if (err instanceof ApiRequestError && err.code === 'ALREADY_DELIVERED') {
+        setMainQueueAnnouncement('该消息已送达模型');
+      } else {
+        pushToast({
+          tone: 'warning',
+          title: '切换队列模式失败',
+          message: err instanceof Error ? err.message : '操作失败',
+        });
+      }
+    } finally {
+      setMainQueueBusyItemId(null);
+    }
+  };
+
+  const handleRecallMainQueueItem = async (item: QueuedMessageItem) => {
+    setMainQueueBusyItemId(item.id);
+    try {
+      const res = await removeTurnQueueItem(item.id);
+      setPendingQueue(res.queue);
+      const recalledText = res.removed?.text || item.text;
+      const recalledImages = res.removedImages;
+      if (recalledText || (recalledImages && recalledImages.length > 0)) {
+        setMainDraftInjection({
+          id: `recall-${item.id}-${Date.now()}`,
+          text: recalledText,
+          ...(recalledImages?.length ? { images: recalledImages } : {}),
+        });
+        setMainQueueAnnouncement('已撤回至输入框编辑');
+      }
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.queue) {
+        setPendingQueue(err.queue);
+      }
+      if (err instanceof ApiRequestError && err.code === 'ALREADY_DELIVERED') {
+        setMainQueueAnnouncement('该消息已送达模型，无法撤回');
+      } else {
+        pushToast({
+          tone: 'warning',
+          title: '撤回队列消息失败',
+          message: err instanceof Error ? err.message : '操作失败',
+        });
+      }
+    } finally {
+      setMainQueueBusyItemId(null);
+    }
+  };
+
+  const handleDeleteMainQueueItem = async (item: QueuedMessageItem) => {
+    setMainQueueBusyItemId(item.id);
+    try {
+      const res = await removeTurnQueueItem(item.id);
+      setPendingQueue(res.queue);
+      setMainQueueAnnouncement('已删除待投递消息');
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.queue) {
+        setPendingQueue(err.queue);
+      }
+      if (!(err instanceof ApiRequestError && err.code === 'ALREADY_DELIVERED')) {
+        pushToast({
+          tone: 'warning',
+          title: '删除队列消息失败',
+          message: err instanceof Error ? err.message : '操作失败',
+        });
+      }
+    } finally {
+      setMainQueueBusyItemId(null);
+    }
+  };
+
+  const handleClearMainQueue = async () => {
+    setMainQueueClearing(true);
+    try {
+      const res = await clearTurnQueue();
+      setPendingQueue(res.queue);
+      if (res.restoredDraft?.text) {
+        applyMainRestoredDraft(res.restoredDraft, 'cleared');
+      } else {
+        setMainQueueAnnouncement('已清空全部待投递消息');
+      }
+    } catch (err) {
+      pushToast({
+        tone: 'warning',
+        title: '清空队列失败',
+        message: err instanceof Error ? err.message : '操作失败',
+      });
+    } finally {
+      setMainQueueClearing(false);
     }
   };
 
   const handleAbort = async () => {
     try {
-      await abortTurn();
+      const res = await abortTurn();
+      if (res?.restoredDraft) {
+        applyMainRestoredDraft(res.restoredDraft, 'aborted');
+      }
     } catch (err) {
       console.error('Error aborting turn:', err);
       addErrorMessage(err instanceof Error ? err.message : '中止执行失败');
+    }
+  };
+
+  const handleAbortSubagentTask = async (
+    targetTaskId: string
+  ): Promise<RestoredDraftPayload | null> => {
+    try {
+      const res = await abortSubagentTask(targetTaskId);
+      return res?.restoredDraft ?? null;
+    } catch (err) {
+      console.error('Error aborting subagent task:', err);
+      pushToast({
+        tone: 'warning',
+        title: '中止子代理失败',
+        message: err instanceof Error ? err.message : '中止执行失败',
+      });
+      return null;
     }
   };
 
@@ -565,38 +1142,6 @@ export function App() {
     }
   }, [isDesktopSidebar]);
 
-  const handleBrowseWorkspaceFromPalette = async () => {
-    if (isStreaming) return;
-    try {
-      const picked = await pickWorkspaceFolder(activeWorkspace || undefined);
-      if (!picked.canceled && picked.path) {
-        await handleQuickSwitchWorkspace(picked.path);
-      }
-    } catch (err) {
-      addErrorMessage(err instanceof Error ? err.message : '打开系统目录选择器失败');
-    }
-  };
-
-  React.useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setIsCommandPaletteOpen((v) => !v);
-      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key === '.') {
-        e.preventDefault();
-        toggleEngineeringPanel();
-      } else if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'n') {
-        if (!isStreaming) {
-          e.preventDefault();
-          void handleNewSession();
-        }
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toggleEngineeringPanel, isStreaming]);
-
   const hasRunningTool = currentTools.some((t) => t.result === undefined || t.result === null);
   const statusLabel = !isStreaming
     ? '就绪'
@@ -621,17 +1166,23 @@ export function App() {
     timestamp: '',
   };
 
-  const isEmpty = messages.length === 0 && !isStreaming;
+  const isEmpty = messages.length === 0 && !isStreaming && !isCompacting;
   const isSidebarVisible = isDesktopSidebar ? isSidebarPinned : isSidebarDrawerOpen;
   const isEngineeringOpen = isDesktopEngineering ? isEngineeringPinned : isEngineeringDrawerOpen;
-  const engineLabel = React.useMemo(() => extractEngineLabel(engineeringStatus), [engineeringStatus]);
+  const engineLabel = React.useMemo(
+    () => resolveEngineDisplay(engineeringStatus).shortLabel,
+    [engineeringStatus]
+  );
   const hasEngineeringAlert = Boolean(
     (engineeringStatus?.batchProgress?.qaFailed ?? 0) > 0 ||
       (engineeringStatus?.postQa && !engineeringStatus.postQa.ok)
   );
   const activeSubagentRoles = React.useMemo(
-    () => getActiveSubagentRoles(currentTools),
-    [currentTools]
+    () =>
+      getActiveSubagentRoles(currentTools, {
+        translatorMode: translatorConfig?.effective.mode,
+      }),
+    [currentTools, translatorConfig?.effective.mode]
   );
 
   const activeSubagentRole = React.useMemo(() => {
@@ -643,6 +1194,58 @@ export function App() {
     return activeSubagentView.roleFilter ?? null;
   }, [activeSubagentView, subagentTasks]);
 
+  const isAnyTurnBusy = isStreaming || isCompacting || Boolean(activeDirectSubagentTaskId);
+  const topStatusLabel = isCompacting
+    ? '正在压缩上下文'
+    : !isStreaming
+      ? activeDirectSubagentTaskId
+        ? '子代理对话中'
+        : '就绪'
+      : statusLabel;
+
+  const runningToolItem = React.useMemo(
+    () => currentTools.find((t) => t.result === undefined || t.result === null) ?? null,
+    [currentTools]
+  );
+
+  const runningDelegatedSubagent = React.useMemo(() => {
+    if (!isStreaming) return null;
+    return (
+      subagentTasks.find(
+        (t) =>
+          t.status === 'running' &&
+          t.role !== 'translator' &&
+          (!activeSessionId || !t.sessionId || t.sessionId === activeSessionId)
+      ) ?? null
+    );
+  }, [isStreaming, subagentTasks, activeSessionId]);
+
+  const mainQueueTimingHint = React.useMemo<PendingQueueTimingHint | null>(() => {
+    if (!isStreaming) return null;
+    if (runningDelegatedSubagent) {
+      return {
+        text: `子代理 ${runningDelegatedSubagent.role} 运行中，返回后接入主对话`,
+        actionLabel: `前往 ${runningDelegatedSubagent.role} 插话`,
+        onAction: () =>
+          handleOpenSubagentTask(runningDelegatedSubagent.taskId, runningDelegatedSubagent.role),
+      };
+    }
+    if (runningToolItem) {
+      return {
+        text: `待当前工具 (${runningToolItem.tool}) 安全完成后立即介入`,
+      };
+    }
+    return {
+      text: '待当前推理步骤结束后立即介入',
+    };
+  }, [isStreaming, runningDelegatedSubagent, runningToolItem]);
+
+  const handleOpenActiveDirectSubagent = React.useCallback(() => {
+    if (!activeDirectSubagentTaskId) return;
+    const found = subagentTasks.find((t) => t.taskId === activeDirectSubagentTaskId);
+    handleOpenSubagentTask(activeDirectSubagentTaskId, found?.role);
+  }, [activeDirectSubagentTaskId, subagentTasks]);
+
   const sidebarProps = {
     activeWorkspace,
     engineLabel,
@@ -650,7 +1253,7 @@ export function App() {
     onOpenWorkspaceSwitcher: () => setIsSwitcherOpen(true),
     sessions,
     activeSessionId,
-    busy: isStreaming,
+    busy: isAnyTurnBusy,
     onNewSession: () => void handleNewSession(),
     onSelectSession: (id: string) => void handleSelectSession(id),
     onRequestDeleteSession: (session: SessionSummary) => setPendingDeleteSession(session),
@@ -719,11 +1322,10 @@ export function App() {
           sessions={sessions}
           activeSessionId={activeSessionId}
           onSelectSession={(id) => void handleSelectSession(id)}
-          onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
           resolvedScheme={resolvedScheme}
           onToggleQuickScheme={toggleQuickScheme}
-          isStreaming={isStreaming}
-          statusLabel={statusLabel}
+          isStreaming={isAnyTurnBusy}
+          statusLabel={topStatusLabel}
           motionAllowed={motionAllowed}
           isDesktopSidebar={isDesktopSidebar}
           isSidebarVisible={isSidebarVisible}
@@ -736,33 +1338,41 @@ export function App() {
           engineeringDrawerId={engineeringDrawerId}
         />
 
-        <div
-          ref={scrollRef}
-          data-scrolled-up={(!isAtBottom && !isEmpty && !activeSubagentView) || undefined}
-          className="pc-stage-scroll pc-scroller relative flex-1"
-        >
-          {activeSubagentView ? (
-            <SubagentTaskView
-              taskId={activeSubagentView.taskId}
-              roleFilter={activeSubagentView.roleFilter}
-              tasks={subagentTasks}
-              currentSessionId={activeSessionId}
-              isMainTurnRunning={isStreaming}
-              onBackToChat={() => setActiveSubagentView(null)}
-              onSelectTask={(nextId) => {
-                const matched = subagentTasks.find((t) => t.taskId === nextId);
-                setActiveSubagentView({
-                  taskId: nextId,
-                  roleFilter: matched?.role ?? activeSubagentView.roleFilter,
-                });
-              }}
-              onAbortTurn={() => void handleAbort()}
-            />
-          ) : (
+        {activeSubagentView ? (
+          <SubagentTaskView
+            taskId={activeSubagentView.taskId}
+            roleFilter={activeSubagentView.roleFilter}
+            tasks={subagentTasks}
+            currentSessionId={activeSessionId}
+            isMainTurnRunning={isStreaming}
+            motionAllowed={motionAllowed}
+            modelSupportsImage={models.find((m) => m.key === (selectedModel || models[0]?.key))?.supportsImage}
+            activeDirectSubagentTaskId={activeDirectSubagentTaskId}
+            subscribeSubagentStream={subscribeSubagentStream}
+            subscribeSubagentQueue={subscribeSubagentQueue}
+            subscribeSubagentQueueRestored={subscribeSubagentQueueRestored}
+            onShowToast={pushToast}
+            onBackToChat={() => setActiveSubagentView(null)}
+            onSelectTask={(nextId) => {
+              const matched = subagentTasks.find((t) => t.taskId === nextId);
+              setActiveSubagentView({
+                taskId: nextId,
+                roleFilter: matched?.role ?? activeSubagentView.roleFilter,
+              });
+            }}
+            onAbortTurn={() => void handleAbort()}
+            onAbortSubagentTask={handleAbortSubagentTask}
+          />
+        ) : (
+          <div
+            ref={scrollRef}
+            data-scrolled-up={(!isAtBottom && !isEmpty) || undefined}
+            className="pc-stage-scroll pc-scroller relative flex-1"
+          >
             <div
               className={cn(
-                'mx-auto w-full max-w-[49rem] px-4 sm:px-6',
-                isEmpty ? 'pt-3 pb-4' : 'pt-6 pb-16'
+                'w-full',
+                isEmpty ? 'pt-4 pb-6' : 'mx-auto max-w-[49rem] px-4 pt-6 pb-16 sm:px-6'
               )}
             >
               {isEmpty ? (
@@ -780,9 +1390,13 @@ export function App() {
                       <MessageItem
                         key={m.id}
                         message={m}
+                        isTurnBusy={isAnyTurnBusy}
                         motionAllowed={motionAllowed}
                         subagentTasks={subagentTasks}
                         onOpenSubagentTask={handleOpenSubagentTask}
+                        chatForms={chatForms}
+                        onSubmitChatForm={handleSubmitChatForm}
+                        onCancelChatForm={handleCancelChatForm}
                       />
                     ))}
                   </div>
@@ -793,63 +1407,101 @@ export function App() {
                         message={streamingMessage}
                         isStreaming
                         isThinking={isThinking}
+                        isTurnBusy={isAnyTurnBusy}
                         statusLabel={`${statusLabel}…`}
                         motionAllowed={motionAllowed}
                         subagentTasks={subagentTasks}
                         onOpenSubagentTask={handleOpenSubagentTask}
+                        chatForms={chatForms}
+                        onSubmitChatForm={handleSubmitChatForm}
+                        onCancelChatForm={handleCancelChatForm}
                       />
+                    </div>
+                  )}
+
+                  {isCompacting && (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="mt-6 flex items-center justify-center gap-2 rounded-xl border border-line bg-well/65 px-3.5 py-2 text-xs text-ink-2"
+                    >
+                      <PixelCupLoader className="text-string" />
+                      <span>正在压缩上下文…</span>
                     </div>
                   )}
                 </>
               )}
               <div ref={bottomRef} className="h-px" aria-hidden="true" />
             </div>
-          )}
 
-          {!isEmpty && !activeSubagentView && (
-            <div className="pc-scroll-bottom-wrap">
-              <button
-                type="button"
-                onClick={scrollToBottom}
-                className="pc-scroll-bottom inline-flex items-center gap-1.5 rounded-full border border-line-strong bg-surface-raised/95 px-3.5 py-1.5 text-xs font-medium text-ink shadow-[var(--shadow-card)] backdrop-blur-sm transition-colors hover:border-string hover:text-string-ink cursor-pointer"
-              >
-                <ArrowDown className="size-3.5" aria-hidden="true" />
-                <span>
-                  {hasUnreadStreamUpdate
-                    ? '有新进展 · 回到最新输出'
-                    : isStreaming
-                      ? '回到最新输出'
-                      : '回到底部'}
-                </span>
-              </button>
-            </div>
-          )}
-        </div>
-
-        {!activeSubagentView && (
-          <div
-            className="pc-composer-scrim pointer-events-none relative z-20 -mt-8 shrink-0 px-3 pt-6 sm:px-6"
-            style={{ paddingBottom: 'max(0.875rem, env(safe-area-inset-bottom, 0px))' }}
-          >
-            <div className="pointer-events-auto">
-              <Composer
-                onSend={handleSend}
-                onAbort={handleAbort}
-                busy={isStreaming}
-                motionAllowed={motionAllowed}
-                models={models}
-                selectedModel={selectedModel}
-                onModelChange={handleModelChange}
-                switchingModel={isSwitchingModel}
-                thinkingLevel={thinkingLevel}
-                availableThinkingLevels={availableThinkingLevels}
-                onThinkingChange={handleThinkingChange}
-                switchingThinking={isSwitchingThinking}
-                onOpenApiKeyModal={() => setIsApiKeyModalOpen(true)}
-              />
-            </div>
+            {!isEmpty && (
+              <div className="pc-scroll-bottom-wrap">
+                <button
+                  type="button"
+                  onClick={scrollToBottom}
+                  className="pc-scroll-bottom inline-flex items-center gap-1.5 rounded-full border border-line-strong bg-surface-raised/95 px-3.5 py-1.5 text-xs font-medium text-ink shadow-[var(--shadow-card)] backdrop-blur-sm transition-colors hover:border-string hover:text-string-ink cursor-pointer"
+                >
+                  <ArrowDown className="size-3.5" aria-hidden="true" />
+                  <span>
+                    {hasUnreadStreamUpdate
+                      ? '有新进展 · 回到最新输出'
+                      : isStreaming
+                        ? '回到最新输出'
+                        : '回到底部'}
+                  </span>
+                </button>
+              </div>
+            )}
           </div>
         )}
+
+        <div
+          className={cn(
+            'pc-composer-scrim pointer-events-none relative z-20 -mt-8 shrink-0 px-3 pt-6 sm:px-6',
+            activeSubagentView && 'hidden'
+          )}
+          aria-hidden={Boolean(activeSubagentView) || undefined}
+          style={{ paddingBottom: 'max(0.875rem, env(safe-area-inset-bottom, 0px))' }}
+        >
+          <div className="pointer-events-auto">
+            <Composer
+              onSend={handleSend}
+              onQueueSend={handleQueueSend}
+              onCompact={handleCompact}
+              onAbort={handleAbort}
+              busy={isAnyTurnBusy}
+              isMainStreaming={isStreaming}
+              isCompacting={isCompacting}
+              queuedCompaction={queuedCompaction}
+              isBlockedByDirectSubagent={Boolean(activeDirectSubagentTaskId) && !isStreaming}
+              onOpenActiveSubagent={handleOpenActiveDirectSubagent}
+              pendingQueue={pendingQueue}
+              queueTimingHint={mainQueueTimingHint}
+              queueBusyItemId={mainQueueBusyItemId}
+              queueClearing={mainQueueClearing}
+              queueStatusAnnouncement={mainQueueAnnouncement}
+              onSwitchQueueMode={(item, mode) => void handleSwitchMainQueueMode(item, mode)}
+              onRecallQueueItem={(item) => void handleRecallMainQueueItem(item)}
+              onDeleteQueueItem={(item) => void handleDeleteMainQueueItem(item)}
+              onClearQueue={() => void handleClearMainQueue()}
+              draftInjection={mainDraftInjection}
+              onDraftInjectionConsumed={(id) =>
+                setMainDraftInjection((prev) => (prev?.id === id ? null : prev))
+              }
+              motionAllowed={motionAllowed}
+              models={models}
+              selectedModel={selectedModel}
+              onModelChange={handleModelChange}
+              switchingModel={isSwitchingModel}
+              thinkingLevel={thinkingLevel}
+              availableThinkingLevels={availableThinkingLevels}
+              onThinkingChange={handleThinkingChange}
+              switchingThinking={isSwitchingThinking}
+              onOpenApiKeyModal={() => setIsApiKeyModalOpen(true)}
+              tokenUsage={tokenUsage}
+            />
+          </div>
+        </div>
       </main>
 
       {isDesktopEngineering ? (
@@ -870,7 +1522,7 @@ export function App() {
                 }
               }}
               onSendPrompt={handleSend}
-              busy={isStreaming}
+              busy={isAnyTurnBusy}
             />
           </aside>
         )
@@ -891,42 +1543,18 @@ export function App() {
               setIsEngineeringDrawerOpen(false);
               void handleSend(prompt);
             }}
-            busy={isStreaming}
+            busy={isAnyTurnBusy}
             inDrawer
           />
         </Drawer>
       )}
-
-      <CommandPalette
-        isOpen={isCommandPaletteOpen}
-        onClose={() => setIsCommandPaletteOpen(false)}
-        busy={isStreaming}
-        activeWorkspace={activeWorkspace}
-        recentWorkspaces={recentWorkspaces}
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        resolvedScheme={resolvedScheme}
-        isSidebarVisible={isSidebarVisible}
-        isEngineeringVisible={isEngineeringOpen}
-        onSendPrompt={(prompt) => void handleSend(prompt)}
-        onNewSession={() => void handleNewSession()}
-        onSelectSession={(id) => void handleSelectSession(id)}
-        onBrowseWorkspace={() => void handleBrowseWorkspaceFromPalette()}
-        onOpenWorkspaceSwitcher={() => setIsSwitcherOpen(true)}
-        onSwitchWorkspace={(wsPath) => void handleQuickSwitchWorkspace(wsPath)}
-        onToggleQuickScheme={toggleQuickScheme}
-        onToggleSidebar={toggleSidebar}
-        onToggleEngineering={toggleEngineeringPanel}
-        onOpenApiKey={() => setIsApiKeyModalOpen(true)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-      />
 
       <WorkspaceDialog
         isOpen={isSwitcherOpen}
         onClose={() => setIsSwitcherOpen(false)}
         activeWorkspace={activeWorkspace}
         recentWorkspaces={recentWorkspaces}
-        busy={isStreaming}
+        busy={isAnyTurnBusy}
         onWorkspaceChanged={handleWorkspaceChanged}
       />
 
@@ -935,7 +1563,7 @@ export function App() {
         onClose={() => setIsApiKeyModalOpen(false)}
         providers={providers}
         currentModel={selectedModel}
-        busy={isStreaming}
+        busy={isAnyTurnBusy}
         onModelsUpdated={applyModelsState}
       />
 
@@ -948,7 +1576,16 @@ export function App() {
         ambientEnabled={ambientEnabled}
         onToggleAmbient={setAmbientEnabled}
         onOpenApiKey={() => setIsApiKeyModalOpen(true)}
-        busy={isStreaming}
+        translatorConfig={translatorConfig}
+        latestSmokeConfig={latestSmokeConfig}
+        onTranslatorConfigUpdated={(next) => {
+          markSyncSeqHandled(next.ollamaSync?.syncSeq);
+          setTranslatorConfig(next);
+          void refreshEngineeringStatus(true);
+        }}
+        onOllamaSyncSeq={markSyncSeqHandled}
+        onShowToast={pushToast}
+        busy={isAnyTurnBusy}
       />
 
       <ConfirmDialog
@@ -961,8 +1598,10 @@ export function App() {
             ? `确定要删除会话「${pendingDeleteSession.title}」吗？此操作仅移除会话记录，不会删除工作区目录中的任何游戏文件。`
             : ''
         }
-        busy={isStreaming}
+        busy={isAnyTurnBusy}
       />
+
+      <ToastRegion toasts={toasts} onDismiss={dismissToast} suppress={isAnyModalOpen} />
     </div>
   );
 }

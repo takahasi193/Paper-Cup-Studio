@@ -59,9 +59,23 @@ interface SidebarProps {
 
 const BUILTIN_ROLES = ['translator', 'reverser', 'role-checker'] as const;
 
-function SectionLabel({ id, children }: { id?: string; children: React.ReactNode }) {
+function SectionLabel({
+  id,
+  inline = false,
+  children,
+}: {
+  id?: string;
+  inline?: boolean;
+  children: React.ReactNode;
+}) {
   return (
-    <h2 id={id} className="px-2 pb-1.5 text-[11px] font-semibold tracking-wide text-ink-3">
+    <h2
+      id={id}
+      className={cn(
+        'px-2 text-[11px] font-semibold tracking-wide text-ink-3',
+        !inline && 'pb-1.5'
+      )}
+    >
       {children}
     </h2>
   );
@@ -170,23 +184,7 @@ export function Sidebar({
         )}
       </div>
 
-      <div className="space-y-2.5 px-3 pb-3">
-        <button
-          type="button"
-          onClick={() => {
-            onNewSession();
-            onCloseDrawer?.();
-          }}
-          disabled={busy}
-          className="flex w-full items-center justify-between gap-2 rounded-xl border border-line-strong bg-surface-raised px-3 py-2 text-[0.8125rem] font-semibold text-ink shadow-[var(--shadow-card)] transition-colors hover:border-string/45 hover:text-string-ink disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
-        >
-          <span className="flex items-center gap-2">
-            <Plus className="size-4 text-string" aria-hidden="true" />
-            <span>新建对话</span>
-          </span>
-          <kbd className="pc-kbd">Alt N</kbd>
-        </button>
-
+      <div className="px-3 pb-3">
         <button
           type="button"
           onClick={() => {
@@ -222,76 +220,95 @@ export function Sidebar({
 
       <nav className="pc-scroller flex-1 space-y-5 overflow-y-auto px-3 pb-4" aria-label="工程导航">
         <section>
-          <div className="flex items-center justify-between pr-0.5">
-            <SectionLabel>对话</SectionLabel>
-            <span className="pb-1.5 font-mono text-[10.5px] text-ink-3">{sessions.length}</span>
+          <div className="flex items-center justify-between gap-2 pb-1.5 pr-0.5">
+            <div className="flex items-center gap-1.5">
+              <SectionLabel inline>对话</SectionLabel>
+              <span className="font-mono text-[10.5px] text-ink-3">{sessions.length}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                onNewSession();
+                onCloseDrawer?.();
+              }}
+              disabled={busy}
+              aria-label="新建对话"
+              title="新建对话"
+              className="inline-flex size-6 items-center justify-center rounded-lg border border-transparent text-ink-2 transition-colors hover:border-string/40 hover:bg-string-soft hover:text-string-ink disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+            >
+              <Plus className="size-3.5" aria-hidden="true" />
+            </button>
           </div>
 
-          <ul className="pc-scroller max-h-64 space-y-0.5 overflow-y-auto">
-            {sessions.map((s) => {
-              const active = s.id === activeSessionId;
-              const relTime = formatRelativeTime(s.updatedAt);
+          {sessions.length === 0 ? (
+            <p className="px-2 py-1.5 text-[11px] text-ink-3">发送首条消息后自动留档</p>
+          ) : (
+            <ul className="pc-scroller max-h-64 space-y-0.5 overflow-y-auto">
+              {sessions.map((s) => {
+                const active = s.id === activeSessionId;
+                const relTime = formatRelativeTime(s.updatedAt);
 
-              return (
-                <li key={s.id} className="pc-reveal-row relative">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onSelectSession(s.id);
-                      onCloseDrawer?.();
-                    }}
-                    disabled={busy}
-                    aria-current={active ? 'true' : undefined}
-                    title={s.title}
-                    className={cn(
-                      'relative flex w-full items-center gap-2 rounded-xl border px-2.5 py-1.5 pr-8 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-55 cursor-pointer',
-                      active
-                        ? 'border-line-strong bg-surface-raised text-ink shadow-[var(--shadow-card)]'
-                        : 'border-transparent text-ink-2 hover:bg-sheet/70 hover:text-ink'
-                    )}
-                  >
-                    {active && (
-                      <span
-                        className="h-4 w-0.5 shrink-0 rounded-full bg-string"
+                return (
+                  <li key={s.id} className="pc-reveal-row relative">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectSession(s.id);
+                        onCloseDrawer?.();
+                      }}
+                      disabled={busy}
+                      aria-current={active ? 'true' : undefined}
+                      title={s.title}
+                      className={cn(
+                        'relative flex w-full items-center gap-2 rounded-xl border px-2.5 py-1.5 pr-8 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-55 cursor-pointer',
+                        active
+                          ? 'border-line-strong bg-surface-raised text-ink shadow-[var(--shadow-card)]'
+                          : 'border-transparent text-ink-2 hover:bg-sheet/70 hover:text-ink'
+                      )}
+                    >
+                      {active && (
+                        <span
+                          className="h-4 w-0.5 shrink-0 rounded-full bg-string"
+                          aria-hidden="true"
+                        />
+                      )}
+                      <MessageSquare
+                        className={cn(
+                          'size-3.5 shrink-0',
+                          active ? 'text-string' : 'text-ink-3'
+                        )}
                         aria-hidden="true"
                       />
-                    )}
-                    <MessageSquare
-                      className={cn(
-                        'size-3.5 shrink-0',
-                        active ? 'text-string' : 'text-ink-3'
-                      )}
-                      aria-hidden="true"
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[0.8125rem] font-medium">
-                        {s.title}
-                      </span>
-                      {relTime && (
-                        <span className="block truncate text-[10.5px] text-ink-3">
-                          {relTime}
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[0.8125rem] font-medium">
+                          {s.title}
                         </span>
-                      )}
-                    </span>
-                  </button>
+                        {relTime && (
+                          <span className="block truncate text-[10.5px] text-ink-3">
+                            {relTime}
+                          </span>
+                        )}
+                      </span>
+                    </button>
 
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onRequestDeleteSession(s);
-                    }}
-                    disabled={busy}
-                    aria-label={`删除会话 ${s.title}`}
-                    title="删除会话"
-                    className="pc-reveal-action absolute top-1/2 right-1 inline-flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
-                  >
-                    <Trash2 className="size-3" aria-hidden="true" />
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRequestDeleteSession(s);
+                      }}
+                      disabled={busy}
+                      aria-label={`删除会话 ${s.title}`}
+                      title="删除会话"
+                      className="pc-reveal-action absolute top-1/2 right-1 inline-flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-danger-soft hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                    >
+                      <Trash2 className="size-3" aria-hidden="true" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </section>
 
         {otherWorkspaces.length > 0 && (

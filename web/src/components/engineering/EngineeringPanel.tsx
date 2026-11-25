@@ -16,7 +16,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { EngineeringStatus } from '@/lib/api.js';
+import { EngineeringStatus, resolveEngineDisplay } from '@/lib/api.js';
 import { gsap, prefersReducedMotion, useGsapDetails } from '@/lib/gsap.js';
 import { cn } from '@/lib/utils.js';
 
@@ -115,18 +115,10 @@ export function EngineeringPanel({
 
   const { detailsRef, bodyRef, chevronRef, handleSummaryClick, handleToggle } = useGsapDetails();
 
-  const rawEngine = status?.engine?.trim() || '';
-  const engineFirstLine = rawEngine.split(/\r?\n/)[0] || '';
-  const isUnknownEngine =
-    !engineFirstLine ||
-    engineFirstLine.includes('未识别') ||
-    engineFirstLine.toLowerCase().startsWith('unknown');
-  const engineKnown = !!status && !isUnknownEngine;
-  const engineDisplay = !status
-    ? '正在识别…'
-    : engineFirstLine.toLowerCase().startsWith('unknown')
-      ? '未识别'
-      : engineFirstLine.replace(/\s{2,}/g, ' · ') || '未识别';
+  const engineInfo = resolveEngineDisplay(status);
+  const rawEngine = engineInfo.rawEngine;
+  const engineKnown = engineInfo.known;
+  const engineDisplay = engineInfo.displayLabel;
 
   const learnedSkills = status?.skills ?? [];
   const batchProgress = status?.batchProgress ?? null;
@@ -305,9 +297,47 @@ export function EngineeringPanel({
               </span>
             </div>
           </div>
-          <div className="pc-ticket-divider flex items-center justify-between px-4 py-2 text-[11px] text-ink-3">
+          <div className="pc-ticket-divider flex items-center justify-between gap-2 px-4 py-2 text-[11px] text-ink-3">
             <span>工作区检测</span>
-            <span className="font-mono">{status?.hasUnpacked ? 'UNPACKED' : 'ARCHIVE'}</span>
+            <div className="flex min-w-0 items-center gap-1.5 font-mono">
+              <span>{status?.hasUnpacked ? 'UNPACKED' : 'ARCHIVE'}</span>
+              {status?.translator && (
+                <span
+                  title={
+                    status.translator.mode === 'local_mt'
+                      ? `${status.translator.model || '未选模型'} · ${status.translator.baseUrl}${
+                          status.translator.ollamaRunning === true
+                            ? ` · Ollama 后台运行中${status.translator.ollamaVersion ? ` v${status.translator.ollamaVersion}` : ''}${status.translator.ollamaManaged ? '（Paper Cup 托管）' : ''}${status.translator.concurrency ? ` · 并发 ${status.translator.concurrency}` : ''}`
+                            : status.translator.ollamaRunning === false
+                              ? ' · 本机 Ollama 未运行'
+                              : ''
+                        }`
+                      : '云端 Subagent'
+                  }
+                  className={cn(
+                    'inline-flex items-center gap-1.5 truncate max-w-[11.5rem] rounded-full border px-2 py-0.5 text-[10px]',
+                    status.translator.mode === 'local_mt'
+                      ? 'border-string/35 bg-string-soft text-string-ink'
+                      : 'border-line bg-sheet text-ink-2'
+                  )}
+                >
+                  {status.translator.mode === 'local_mt' && status.translator.ollamaRunning !== undefined && (
+                    <span
+                      className={cn(
+                        'size-1.5 shrink-0 rounded-full',
+                        status.translator.ollamaRunning ? 'bg-ok' : 'bg-warn'
+                      )}
+                      aria-hidden="true"
+                    />
+                  )}
+                  <span className="truncate">
+                    {status.translator.mode === 'local_mt'
+                      ? `本地 MT${status.translator.model ? ` · ${status.translator.model}` : ''}`
+                      : '云端 Subagent'}
+                  </span>
+                </span>
+              )}
+            </div>
           </div>
         </section>
 
@@ -432,6 +462,35 @@ export function EngineeringPanel({
                 待译 {batchProgress.pendingBatches}
               </span>
             </div>
+
+            {batchProgress.routeStats &&
+              batchProgress.routeStats.localMt +
+                batchProgress.routeStats.tmCache +
+                batchProgress.routeStats.cloudEscalated >
+                0 && (
+                <div className="flex flex-wrap gap-1.5 border-t border-line pt-2 text-[10.5px] text-ink-3">
+                  {batchProgress.routeStats.localMt > 0 && (
+                    <span className="rounded-md border border-line bg-sheet px-1.5 py-0.5 font-mono">
+                      本地 MT {batchProgress.routeStats.localMt}
+                    </span>
+                  )}
+                  {batchProgress.routeStats.tmCache > 0 && (
+                    <span className="rounded-md border border-line bg-sheet px-1.5 py-0.5 font-mono">
+                      TM 缓存 {batchProgress.routeStats.tmCache}
+                    </span>
+                  )}
+                  {batchProgress.routeStats.cloudEscalated > 0 && (
+                    <span className="rounded-md border border-string/35 bg-string-soft px-1.5 py-0.5 font-mono text-string-ink">
+                      云端升舱 {batchProgress.routeStats.cloudEscalated}
+                    </span>
+                  )}
+                  {batchProgress.routeStats.cloudSubagent > 0 && (
+                    <span className="rounded-md border border-line bg-sheet px-1.5 py-0.5 font-mono">
+                      云端 Subagent {batchProgress.routeStats.cloudSubagent}
+                    </span>
+                  )}
+                </div>
+              )}
           </section>
         )}
 

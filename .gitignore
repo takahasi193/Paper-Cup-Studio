@@ -36,6 +36,8 @@ papercup.toml
 # Optional real VN archives used by tests/agent/vn (never commit)
 tests/agent/vn/samples/*.rpa
 tests/agent/vn/samples/*.xp3
+server/bench/reverser/runs/
+server/native/win32-proxy/bin/
 
 # IDE & OS
 .vscode/

@@ -15,8 +15,63 @@ export type FolderPickerFn = (options?: {
   title?: string;
 }) => Promise<FolderPickResult>;
 
+export type FilePickerFn = (options?: {
+  initialPath?: string;
+  title?: string;
+  filter?: string;
+}) => Promise<FolderPickResult>;
+
 const DEFAULT_TITLE = '选择游戏工作区目录';
+const DEFAULT_FILE_TITLE = '选择 Ollama 可执行文件';
+const DEFAULT_FILE_FILTER = 'Ollama 可执行文件 (ollama.exe)|ollama.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*';
 const PICKER_TIMEOUT_MS = 5 * 60 * 1000;
+
+export const WINDOWS_FILE_PICKER_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing | Out-Null
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$initDir = $env:PAPERCUP_PICKER_INIT
+$dlgTitle = $env:PAPERCUP_PICKER_TITLE
+$dlgFilter = $env:PAPERCUP_PICKER_FILTER
+if ([string]::IsNullOrWhiteSpace($dlgTitle)) { $dlgTitle = '选择 Ollama 可执行文件' }
+if ([string]::IsNullOrWhiteSpace($dlgFilter)) { $dlgFilter = '所有文件 (*.*)|*.*' }
+
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$owner.Opacity = 0
+
+$dlg = New-Object System.Windows.Forms.OpenFileDialog
+$dlg.Title = $dlgTitle
+$dlg.Filter = $dlgFilter
+$dlg.Multiselect = $false
+$dlg.CheckFileExists = $true
+$dlg.CheckPathExists = $true
+$dlg.DereferenceLinks = $true
+if (-not [string]::IsNullOrWhiteSpace($initDir) -and (Test-Path -LiteralPath $initDir -PathType Container)) {
+  $dlg.InitialDirectory = $initDir
+}
+
+try {
+  $owner.Show()
+  $owner.Activate()
+  $res = $dlg.ShowDialog($owner)
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($dlg.FileName)) {
+    [Console]::Out.Write($dlg.FileName)
+  }
+} finally {
+  $dlg.Dispose()
+  $owner.Dispose()
+}
+`;
 
 export const WINDOWS_FOLDER_PICKER_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -185,9 +240,16 @@ try {
 function resolveInitialDir(initialDir?: string): string | undefined {
   if (!initialDir || !initialDir.trim()) return undefined;
   try {
-    const resolved = path.resolve(initialDir.trim());
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-      return resolved;
+    const cleaned = initialDir.trim().replace(/^"(.*)"$/, '$1');
+    const resolved = path.resolve(cleaned);
+    if (fs.existsSync(resolved)) {
+      const st = fs.statSync(resolved);
+      if (st.isDirectory()) return resolved;
+      if (st.isFile()) return path.dirname(resolved);
+    }
+    const parent = path.dirname(resolved);
+    if (fs.existsSync(parent) && fs.statSync(parent).isDirectory()) {
+      return parent;
     }
   } catch {
     // Ignore invalid initialDir hint
@@ -195,14 +257,20 @@ function resolveInitialDir(initialDir?: string): string | undefined {
   return undefined;
 }
 
-function validatePickedPath(rawPath: string): FolderPickResult {
+function validatePickedTarget(rawPath: string, kind: 'directory' | 'file'): FolderPickResult {
   const cleaned = rawPath.replace(/[\r\n]+$/g, '').trim();
   if (!cleaned) {
     return { canceled: true, path: null };
   }
   const resolved = path.resolve(cleaned);
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-    throw new Error(`所选路径不是有效目录：${resolved}`);
+  if (kind === 'directory') {
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      throw new Error(`所选路径不是有效目录：${resolved}`);
+    }
+  } else {
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      throw new Error(`所选路径不是有效文件：${resolved}`);
+    }
   }
   return { canceled: false, path: resolved };
 }
@@ -227,7 +295,35 @@ async function pickFolderWindows(initialDir: string | undefined, title: string):
       maxBuffer: 1024 * 1024,
     }
   );
-  return validatePickedPath(stdout || '');
+  return validatePickedTarget(stdout || '', 'directory');
+}
+
+async function pickFileWindows(
+  initialDir: string | undefined,
+  title: string,
+  filter: string
+): Promise<FolderPickResult> {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (initialDir) {
+    env.PAPERCUP_PICKER_INIT = initialDir;
+  } else {
+    delete env.PAPERCUP_PICKER_INIT;
+  }
+  env.PAPERCUP_PICKER_TITLE = title;
+  env.PAPERCUP_PICKER_FILTER = filter;
+
+  const encoded = Buffer.from(WINDOWS_FILE_PICKER_SCRIPT, 'utf16le').toString('base64');
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded],
+    {
+      env,
+      windowsHide: true,
+      timeout: PICKER_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    }
+  );
+  return validatePickedTarget(stdout || '', 'file');
 }
 
 async function pickFolderMac(initialDir: string | undefined, title: string): Promise<FolderPickResult> {
@@ -243,13 +339,36 @@ async function pickFolderMac(initialDir: string | undefined, title: string): Pro
       timeout: PICKER_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
     });
-    return validatePickedPath(stdout || '');
+    return validatePickedTarget(stdout || '', 'directory');
   } catch (err: any) {
     const msg = String(err?.stderr || err?.message || '');
     if (err?.code === 1 || /-128/.test(msg) || /User canceled/i.test(msg)) {
       return { canceled: true, path: null };
     }
     throw new Error(`系统目录选择器调用失败：${msg || '未知错误'}`);
+  }
+}
+
+async function pickFileMac(initialDir: string | undefined, title: string): Promise<FolderPickResult> {
+  const safePrompt = title.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const scriptLines = initialDir
+    ? [
+        `set defaultAlias to POSIX file ${JSON.stringify(initialDir)}`,
+        `POSIX path of (choose file with prompt "${safePrompt}" default location defaultAlias)`,
+      ]
+    : [`POSIX path of (choose file with prompt "${safePrompt}")`];
+  try {
+    const { stdout } = await execFileAsync('osascript', scriptLines.flatMap((line) => ['-e', line]), {
+      timeout: PICKER_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    return validatePickedTarget(stdout || '', 'file');
+  } catch (err: any) {
+    const msg = String(err?.stderr || err?.message || '');
+    if (err?.code === 1 || /-128/.test(msg) || /User canceled/i.test(msg)) {
+      return { canceled: true, path: null };
+    }
+    throw new Error(`系统文件选择器调用失败：${msg || '未知错误'}`);
   }
 }
 
@@ -263,7 +382,7 @@ async function pickFolderLinux(initialDir: string | undefined, title: string): P
       timeout: PICKER_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
     });
-    return validatePickedPath(stdout || '');
+    return validatePickedTarget(stdout || '', 'directory');
   } catch (err: any) {
     if (err?.code === 1) {
       return { canceled: true, path: null };
@@ -279,7 +398,7 @@ async function pickFolderLinux(initialDir: string | undefined, title: string): P
       timeout: PICKER_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
     });
-    return validatePickedPath(stdout || '');
+    return validatePickedTarget(stdout || '', 'directory');
   } catch (err: any) {
     if (err?.code === 1) {
       return { canceled: true, path: null };
@@ -288,6 +407,44 @@ async function pickFolderLinux(initialDir: string | undefined, title: string): P
       throw new Error('当前系统环境未安装原生目录选择器（zenity / kdialog），请在输入框中直接输入目录路径。');
     }
     throw new Error(`系统目录选择器调用失败：${err?.message || err}`);
+  }
+}
+
+async function pickFileLinux(initialDir: string | undefined, title: string): Promise<FolderPickResult> {
+  const zenityArgs = ['--file-selection', `--title=${title}`];
+  if (initialDir) {
+    zenityArgs.push(`--filename=${initialDir.endsWith('/') ? initialDir : `${initialDir}/`}`);
+  }
+  try {
+    const { stdout } = await execFileAsync('zenity', zenityArgs, {
+      timeout: PICKER_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    return validatePickedTarget(stdout || '', 'file');
+  } catch (err: any) {
+    if (err?.code === 1) {
+      return { canceled: true, path: null };
+    }
+    if (err?.code !== 'ENOENT') {
+      throw new Error(`系统文件选择器调用失败：${err?.message || err}`);
+    }
+  }
+
+  const kdialogArgs = ['--getopenfilename', initialDir || process.cwd(), '*', '--title', title];
+  try {
+    const { stdout } = await execFileAsync('kdialog', kdialogArgs, {
+      timeout: PICKER_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+    return validatePickedTarget(stdout || '', 'file');
+  } catch (err: any) {
+    if (err?.code === 1) {
+      return { canceled: true, path: null };
+    }
+    if (err?.code === 'ENOENT') {
+      throw new Error('当前系统环境未安装原生文件选择器（zenity / kdialog），请在输入框中直接输入可执行文件路径。');
+    }
+    throw new Error(`系统文件选择器调用失败：${err?.message || err}`);
   }
 }
 
@@ -305,4 +462,22 @@ export async function pickFolderNative(options?: {
     return pickFolderMac(initialDir, title);
   }
   return pickFolderLinux(initialDir, title);
+}
+
+export async function pickFileNative(options?: {
+  initialPath?: string;
+  title?: string;
+  filter?: string;
+}): Promise<FolderPickResult> {
+  const initialDir = resolveInitialDir(options?.initialPath);
+  const title = options?.title?.trim() || DEFAULT_FILE_TITLE;
+  const filter = options?.filter?.trim() || DEFAULT_FILE_FILTER;
+
+  if (process.platform === 'win32') {
+    return pickFileWindows(initialDir, title, filter);
+  }
+  if (process.platform === 'darwin') {
+    return pickFileMac(initialDir, title);
+  }
+  return pickFileLinux(initialDir, title);
 }

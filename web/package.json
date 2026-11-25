@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node -e \"import('node:fs').then(async fs=>{const path=await import('node:path');const {spawnSync}=await import('node:child_process');const dir='tests';if(!fs.existsSync(dir)){console.log('[web] No web/tests directory yet; skipping.');process.exit(0);}const files=fs.readdirSync(dir).filter(f=>/\\.test\\.(?:[cm]?[jt]s|tsx)$/.test(f)).sort().map(f=>path.join(dir,f));if(!files.length){console.log('[web] No test files in web/tests; skipping.');process.exit(0);}const tsxCandidates=[path.resolve('node_modules/tsx/dist/cli.mjs'),path.resolve('../server/node_modules/tsx/dist/cli.mjs')];const tsxCli=tsxCandidates.find(p=>fs.existsSync(p));const args=tsxCli?[tsxCli,'--test',...files]:['--test',...files];const r=spawnSync(process.execPath,args,{stdio:'inherit'});process.exit(r.status??1);})\""
   },
   "dependencies": {
     "@fontsource/instrument-serif": "^5.3.0",

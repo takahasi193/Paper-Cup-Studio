@@ -6,10 +6,18 @@ import { cn } from '@/lib/utils.js';
 
 const REMARK_PLUGINS = [remarkGfm];
 
-function safeUrlTransform(url: string): string {
-  const transformed = defaultUrlTransform(url);
+export function safeUrlTransform(url: string): string {
+  const raw = String(url ?? '').trim();
+  // Explicitly reject protocol-relative URLs (//evil.example) and backslash variants (/\evil, \\evil)
+  if (!raw || /^\/[\\/]/.test(raw) || raw.startsWith('\\')) {
+    return '';
+  }
+  const transformed = defaultUrlTransform(raw);
   if (!transformed) return '';
   const trimmed = transformed.trim();
+  if (!trimmed || /^\/[\\/]/.test(trimmed) || trimmed.startsWith('\\')) {
+    return '';
+  }
   if (trimmed.startsWith('#') || trimmed.startsWith('/')) {
     return transformed;
   }
@@ -58,13 +66,17 @@ function MarkdownPreBlock({ children }: { children?: React.ReactNode }) {
   );
 }
 
+export function isExternalUrl(url: string): boolean {
+  return /^(?:https?:)?\/\//i.test(String(url ?? '').trim());
+}
+
 const MARKDOWN_COMPONENTS: Components = {
   a: ({ href, children, node: _node, ...rest }) => {
     const cleanHref = href ? safeUrlTransform(href) : '';
     if (!cleanHref) {
       return <span>{children}</span>;
     }
-    const isExternal = /^https?:\/\//i.test(cleanHref);
+    const isExternal = isExternalUrl(cleanHref);
     return (
       <a
         {...rest}
@@ -95,17 +107,34 @@ const MemoMarkdownBlock = React.memo(function MemoMarkdownBlock({ text }: { text
   );
 });
 
+const LIST_ITEM_LINE_RE = /^\s{0,3}(?:\d+[.)]|[-*+])\s+/;
+const BLOCKQUOTE_LINE_RE = /^\s{0,3}>/;
+const INDENTED_CONTINUATION_RE = /^(?:\t| {2,})\S/;
+const REFERENCE_LINK_OR_DEF_RE = /(?:^|\n)\s{0,3}\[[^\]]+\]:\s*\S|\]\[[^\]]*\]/;
+
 /**
- * 流式输出阶段按围栏外空行切分已完成块，避免长文本每次增量重解析整篇文档。
+ * 流式输出阶段按围栏外安全空行切分已完成块，避免长文本每次增量重解析整篇文档。
+ * 保留引用式链接文档完整解析，并避免在松散列表/引用块中间切分导致编号归零或块断裂。
  */
-function splitStableMarkdownBlocks(text: string): { stable: string[]; tail: string } {
+export function splitStableMarkdownBlocks(text: string): { stable: string[]; tail: string } {
+  if (!text || REFERENCE_LINK_OR_DEF_RE.test(text)) {
+    return { stable: [], tail: text };
+  }
+
   const lines = text.split('\n');
   const stable: string[] = [];
   let blockStart = 0;
   let fenceChar = '';
   let fenceLen = 0;
 
-  for (let i = 0; i < lines.length; i++) {
+  const findNextNonEmptyLine = (fromIndex: number): string | null => {
+    for (let j = fromIndex; j < lines.length; j += 1) {
+      if (lines[j].trim() !== '') return lines[j];
+    }
+    return null;
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
     if (fenceMatch) {
@@ -124,7 +153,22 @@ function splitStableMarkdownBlocks(text: string): { stable: string[]; tail: stri
     }
 
     if (!fenceChar && line.trim() === '' && i > blockStart && i < lines.length - 1) {
-      const chunk = lines.slice(blockStart, i).join('\n').trim();
+      const nextNonEmpty = findNextNonEmptyLine(i + 1);
+      if (nextNonEmpty === null) continue;
+
+      const chunkLines = lines.slice(blockStart, i);
+      const startsList = LIST_ITEM_LINE_RE.test(chunkLines[0] ?? '');
+      const startsQuote = BLOCKQUOTE_LINE_RE.test(chunkLines[0] ?? '');
+      const nextContinuesList =
+        startsList &&
+        (LIST_ITEM_LINE_RE.test(nextNonEmpty) || INDENTED_CONTINUATION_RE.test(nextNonEmpty));
+      const nextContinuesQuote = startsQuote && BLOCKQUOTE_LINE_RE.test(nextNonEmpty);
+
+      if (nextContinuesList || nextContinuesQuote) {
+        continue;
+      }
+
+      const chunk = chunkLines.join('\n').trim();
       if (chunk) {
         stable.push(chunk);
       }

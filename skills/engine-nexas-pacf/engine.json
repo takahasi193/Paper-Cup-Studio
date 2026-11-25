@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "name": "nexas-pacf",
+  "kinds": [
+    "pac"
+  ],
+  "versions": [
+    "pacf-zstd"
+  ],
+  "pipeline": "skill",
+  "skill": "engine-nexas-pacf",
+  "skill-sha256": "8ab0a1f05e4c99cac2eb7b696cf0004bfe7c577ba30fdc7c786275653307dae3",
+  "unpack-sha256": "541a21c9279f85111974ee0d6452e157ab97d562d3d9deaeb952ad300c1dc5bc",
+  "repack-sha256": "2bd4a5997d6515be675dd72df5007a35c0396fa9aad086b9cd404014c01cfce3",
+  "extract-sha256": "7a9350dfb54c699383c046d19f913bde5129c2c3242aebf65931d157a037c3a0",
+  "apply-sha256": "13c5a5f27cb8062f5c8aeced8953b789bb9dc4c46eebc91999ead981d65069a1",
+  "match": {
+    "extensions": [
+      ".pac"
+    ],
+    "magic_hex": "50414346",
+    "magic_offset": 0
+  },
+  "writeback": {
+    "mode": "skill_apply",
+    "encoding": "utf-8",
+    "control_pattern": "@r[^@]+@[^@]+@|@[A-Za-z](?![A-Za-z])|<[^>]+>",
+    "repack_cmd": "vn_repack",
+    "verified": true
+  },
+  "system_text": {
+    "files": [
+      "*.lngt"
+    ],
+    "notes": [
+      "NeXAS PACF uses zstd payloads with trailing XOR 0xFF MSB-first static Huffman 76-byte TOC.",
+      "extract.py filters TOC filename/stem jump targets automatically; apply.py preserves .lngt trailing blank lines and writes zero sidecar files."
+    ]
+  }
+}

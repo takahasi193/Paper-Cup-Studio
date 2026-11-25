@@ -18,26 +18,40 @@ import {
   normalizeEncodingName,
   parseKsLine,
   realpathSafe,
+  resolveWorkspaceControlPattern,
   Skeleton,
   splitLines,
   type LocalizationProfile,
   type ProjectMemory,
+  type TranslatorMode,
 } from './profile.js';
-import { qaReport } from './qa.js';
+import { checkCrossRowNameConsistency, qaReport, type QaFinding } from './qa.js';
+import type { BatchRouteStats } from './translation-packet.js';
 import {
   estimateRecordTokens,
   estimateRecordsStats,
   estimateWithMargin,
   resolveFamily,
 } from './tokens.js';
+import {
+  WORKSPACE_APPLY_REL,
+  WORKSPACE_BATCHES_MANIFEST_REL,
+  WORKSPACE_BUILD_REL,
+  WORKSPACE_COUNTS_REL,
+  WORKSPACE_MANIFEST_REL,
+  WORKSPACE_PLAN_REL,
+  WORKSPACE_PROGRESS_REL,
+  WORKSPACE_WORK_OUT_REL,
+  resolveWorkspacePaths,
+} from './workspace-paths.js';
 
 export const CLASSIFIER_VERSION = '1';
-export const MANIFEST_REL = '.papercup/vn/text.json';
-export const APPLY_REL = '.papercup/vn/apply.json';
-export const PLAN_REL = '.papercup/vn/plan.json';
-export const PROGRESS_REL = '.papercup/vn/progress.json';
-export const BATCHES_MANIFEST_REL = 'work/batches/manifest.json';
-export const COUNTS_REL = 'work/counts.json';
+export const MANIFEST_REL = WORKSPACE_MANIFEST_REL;
+export const APPLY_REL = WORKSPACE_APPLY_REL;
+export const PLAN_REL = WORKSPACE_PLAN_REL;
+export const PROGRESS_REL = WORKSPACE_PROGRESS_REL;
+export const BATCHES_MANIFEST_REL = WORKSPACE_BATCHES_MANIFEST_REL;
+export const COUNTS_REL = WORKSPACE_COUNTS_REL;
 export const SCENARIO_NAME = 'scenario.jsonl';
 export const UI_NAME = 'ui.jsonl';
 
@@ -45,12 +59,16 @@ export const TRACKS = ['scenario', 'ui'] as const;
 export type TrackName = (typeof TRACKS)[number];
 export const TRACK_LABELS: Record<string, string> = { scenario: '剧情轨', ui: '界面轨' };
 
+export const DEFAULT_CLOUD_CONCURRENCY = 8;
+export const MAX_CLOUD_CONCURRENCY = 32;
+export const DEFAULT_POST_QA_CHUNK_LINES = 120;
+
 const MAX_FILES = 4096;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_DEPTH = 16;
 const MAX_WALK = 8192;
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
-const MAX_RECORDS = 20000;
+const MAX_RECORDS = 500000;
 
 const ENGINE_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const IDENT_RE = /^[A-Za-z_]\w*$/;
@@ -98,7 +116,7 @@ const RENPY_SKIP = new Set([
   'screen', 'show', 'stop', 'style', 'timer', 'transform', 'translate', 'use', 'vbox', 'voice', 'while',
   'window', 'with', 'zorder',
 ]);
-const SILENT_DIRS = new Set(['.git', '.hg', '.svn', '.papercup', 'node_modules', '__pycache__', '.venv', 'venv', 'cache']);
+const SILENT_DIRS = new Set(['.git', '.hg', '.svn', '.papercup', 'node_modules', '__pycache__', '.venv', 'venv', 'cache', 'patch']);
 
 export class ClassifyError extends Error {}
 export class ApplyError extends Error {}
@@ -482,7 +500,9 @@ function classifyRenpy(filePath: string, text: string, rules: ClassifyRules): { 
           const opened = openRenpyString(stripped.slice(charPos).replace(/^\s+/, ''));
           if (opened) {
             const src = visibleRenpy(opened[0]);
-            if (src) rec = { id: `${filePath}#${number}`, file: filePath, line: number, scene, speaker: '', kind: 'name', source: src };
+            const defMatch = /^(?:define|default)\s+([A-Za-z_]\w*)\s*=/.exec(stripped);
+            const charSpeakerId = defMatch ? defMatch[1] : '';
+            if (src) rec = { id: `${filePath}#${number}`, file: filePath, line: number, scene, speaker: charSpeakerId, kind: 'name', source: src };
           }
         } else {
           const tokMatch = /^([A-Za-z_]\w*)(.*)$/s.exec(stripped);
@@ -830,8 +850,39 @@ function splitKeepEnds(text: string): string[] {
   return matches;
 }
 
+export interface ApplyWrittenFile {
+  path: string;
+  backup: string;
+  sha256_before: string;
+  sha256_after: string;
+  encoding_before: string;
+  encoding_after: string;
+  segments: number;
+}
+
+export interface ApplyReport {
+  schema: 1;
+  created: string;
+  track: string;
+  scene: string;
+  root: string;
+  partial: boolean;
+  segments: {
+    total: number;
+    applied: number;
+    skipped: number;
+    expected_total?: number;
+    missing?: number;
+  };
+  files: ApplyWrittenFile[];
+  skipped: Array<{ id: string; reason: string }>;
+  expected_total?: number;
+  manifest_digest?: string;
+  results_sha256?: string;
+}
+
 export interface ApplyOutcome {
-  report: Record<string, unknown>;
+  report: ApplyReport;
   reportPath: string;
   partial: boolean;
   applied: number;
@@ -844,7 +895,13 @@ export function applyResults(
   profile: LocalizationProfile,
   memory: ProjectMemory,
   track: string,
-  options: { scene?: string; allowPartial?: boolean; encoding?: string | null } = {}
+  options: {
+    scene?: string;
+    allowPartial?: boolean;
+    encoding?: string | null;
+    controlPattern?: string | null;
+    homeDir?: string | null;
+  } = {}
 ): ApplyOutcome {
   if (!TRACKS.includes(track as TrackName)) throw new ApplyError('落盘轨道只能是 scenario 或 ui。');
   let requestedEnc: string | null = null;
@@ -857,6 +914,10 @@ export function applyResults(
   if (!base || isSymlinkPath(base) || !fs.existsSync(base) || !fs.statSync(base).isDirectory()) {
     throw new ApplyError(`解包根目录必须在工作区内且是目录：${rootDir}`);
   }
+  const controlPattern =
+    options.controlPattern !== undefined
+      ? options.controlPattern
+      : resolveWorkspaceControlPattern(workspace, options.homeDir);
   const scene = (options.scene || '').trim();
   const candidates: Array<Record<string, unknown>> = [];
   for (const item of results) {
@@ -906,7 +967,7 @@ export function applyResults(
     if (target.includes('\n') || target.includes('\r')) {
       throw new ApplyError(`${idText} 的译文含换行；会破坏脚本行结构。`);
     }
-    const rep = qaReport(source, target, profile, memory.glossary);
+    const rep = qaReport(source, target, profile, memory.glossary, { controlPattern });
     if (rep.blocked) {
       const detail = rep.findings
         .filter((f) => f.severity === 'error')
@@ -947,10 +1008,29 @@ export function applyResults(
     );
   }
 
-  const written: Array<Record<string, unknown>> = [];
+  const reportPath = path.join(workspace, APPLY_REL);
+  if (isSymlinkPath(reportPath)) throw new ApplyError(`落盘报告不能是符号链接：${reportPath}`);
+
+  // Phase 1: validate, match, and encode ALL target files in memory before touching disk
+  const prepared: Array<{
+    targetFile: string;
+    backupPath: string;
+    origBytes: Buffer;
+    outBuf: Buffer;
+    sourceEnc: string;
+    targetEnc: string;
+    segments: number;
+  }> = [];
+
   for (const [rel, items] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const targetFile = insideWorkspace(workspace, path.join(base, rel));
-    if (!targetFile || isSymlinkPath(targetFile) || !fs.existsSync(targetFile) || !fs.statSync(targetFile).isFile()) {
+    const targetFile = insideWorkspace(base, rel);
+    if (
+      !targetFile ||
+      !insideWorkspace(workspace, targetFile) ||
+      isSymlinkPath(targetFile) ||
+      !fs.existsSync(targetFile) ||
+      !fs.statSync(targetFile).isFile()
+    ) {
       throw new ApplyError(`脚本不存在或不是普通文件：${rel}`);
     }
     const origBytes = fs.readFileSync(targetFile);
@@ -991,7 +1071,7 @@ export function applyResults(
     let outBuf: Buffer;
     try {
       outBuf = encodeText(payloadText, targetEnc);
-    } catch (err) {
+    } catch {
       if (requestedEnc) {
         throw new ApplyError(`译文无法用指定编码 ${requestedEnc} 写回 ${displayRel(targetFile, base)}。`);
       }
@@ -1004,32 +1084,62 @@ export function applyResults(
     }
 
     const backupPath = `${targetFile}.bak`;
-    if (isSymlinkPath(backupPath)) throw new ApplyError(`备份路径不能是符号链接：${displayRel(backupPath, base)}`);
-    const tmpPath = `${targetFile}.tmp`;
-    fs.writeFileSync(backupPath, origBytes);
-    fs.writeFileSync(tmpPath, outBuf);
-    fs.renameSync(tmpPath, targetFile);
+    if (isSymlinkPath(backupPath)) {
+      throw new ApplyError(`备份路径不能是符号链接：${displayRel(backupPath, base)}`);
+    }
+
+    prepared.push({
+      targetFile,
+      backupPath,
+      origBytes,
+      outBuf,
+      sourceEnc,
+      targetEnc,
+      segments: items.length,
+    });
+  }
+
+  // Phase 2: commit all prepared files atomically and preserve initial original .bak backups
+  const written: ApplyWrittenFile[] = [];
+  for (const plan of prepared) {
+    if (!fs.existsSync(plan.backupPath)) {
+      fs.writeFileSync(plan.backupPath, plan.origBytes);
+    }
+    const tmpPath = `${plan.targetFile}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, plan.outBuf);
+      fs.renameSync(tmpPath, plan.targetFile);
+    } catch (err) {
+      if (fs.existsSync(tmpPath)) {
+        try {
+          fs.rmSync(tmpPath, { force: true });
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+      throw err;
+    }
 
     written.push({
-      path: displayRel(targetFile, base),
-      backup: displayRel(backupPath, base),
-      sha256_before: crypto.createHash('sha256').update(origBytes).digest('hex'),
-      sha256_after: crypto.createHash('sha256').update(outBuf).digest('hex'),
-      encoding_before: sourceEnc,
-      encoding_after: targetEnc,
-      segments: items.length,
+      path: displayRel(plan.targetFile, base),
+      backup: displayRel(plan.backupPath, base),
+      sha256_before: crypto.createHash('sha256').update(plan.origBytes).digest('hex'),
+      sha256_after: crypto.createHash('sha256').update(plan.outBuf).digest('hex'),
+      encoding_before: plan.sourceEnc,
+      encoding_after: plan.targetEnc,
+      segments: plan.segments,
     });
   }
 
   const manifest = !scene ? readManifest(workspace) : null;
   const manifestDigest = typeof manifest?.digest === 'string' ? manifest.digest : '';
-  const resultsFile = path.join(workspace, 'results', `${track}.jsonl`);
+  const resultsFile = resolveWorkspacePaths(workspace).resultsTrackFile(track);
   let resultsSha256 = '';
   if (!scene && !isSymlinkPath(resultsFile) && fs.existsSync(resultsFile) && fs.statSync(resultsFile).isFile()) {
     resultsSha256 = crypto.createHash('sha256').update(fs.readFileSync(resultsFile)).digest('hex');
   }
 
-  const segsBlock: Record<string, unknown> = {
+  const segsBlock: ApplyReport['segments'] = {
     total: candidates.length,
     applied: appliedCount,
     skipped: blocked.length,
@@ -1039,7 +1149,7 @@ export function applyResults(
     segsBlock.missing = expectedTotal - appliedCount;
   }
 
-  const report: Record<string, unknown> = {
+  const report: ApplyReport = {
     schema: 1,
     created: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     track,
@@ -1054,8 +1164,6 @@ export function applyResults(
   if (manifestDigest) report.manifest_digest = manifestDigest;
   if (resultsSha256) report.results_sha256 = resultsSha256;
 
-  const reportPath = path.join(workspace, APPLY_REL);
-  if (isSymlinkPath(reportPath)) throw new ApplyError(`落盘报告不能是符号链接：${reportPath}`);
   atomicWriteText(reportPath, JSON.stringify(report, null, 2) + '\n');
 
   return {
@@ -1103,7 +1211,7 @@ export function applyStatus(workspace: string): {
         staleReason = '分轨清单已变更';
       }
       if (!stale && TRACKS.includes(track as TrackName)) {
-        const resPath = path.join(workspace, 'results', `${track}.jsonl`);
+        const resPath = resolveWorkspacePaths(workspace).resultsTrackFile(track);
         if (!isSymlinkPath(resPath) && fs.existsSync(resPath) && fs.statSync(resPath).isFile()) {
           if (typeof report.results_sha256 === 'string' && report.results_sha256) {
             const sha = crypto.createHash('sha256').update(fs.readFileSync(resPath)).digest('hex');
@@ -1146,14 +1254,14 @@ export function defaultPlanConfig(): PlanConfig {
     batch_max_lines: 30,
     batch_max_source_tokens: 4000,
     session_max_source_tokens: 40000,
-    concurrency: 4,
+    concurrency: DEFAULT_CLOUD_CONCURRENCY,
     margin_ratio: 0.1,
     note: '',
   };
 }
 
 function loadBuildTrackRows(workspace: string, track: TrackName): Array<Record<string, unknown>> {
-  const file = path.join(workspace, 'build', `${track}.jsonl`);
+  const file = resolveWorkspacePaths(workspace).buildTrackFile(track);
   if (isSymlinkPath(file) || !fs.existsSync(file) || !fs.statSync(file).isFile()) return [];
   const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
   const out: Array<Record<string, unknown>> = [];
@@ -1180,7 +1288,7 @@ export function analyzeWorkspaceText(workspace: string, options: { model?: strin
   const uiRows = loadBuildTrackRows(workspace, 'ui');
   const allRows = [...scenarioRows, ...uiRows];
   if (!allRows.length) {
-    throw new PlanError('工作区还没有分类产物（build/scenario.jsonl 或 build/ui.jsonl）；先运行 vn_classify。');
+    throw new PlanError(`工作区还没有分类产物（${WORKSPACE_BUILD_REL}/scenario.jsonl 或 ${WORKSPACE_BUILD_REL}/ui.jsonl）；先运行 vn_classify。`);
   }
   const family = resolveFamily(options.model || '', options.family || '');
   const stats = estimateRecordsStats(allRows, family);
@@ -1223,7 +1331,12 @@ export function savePlanConfig(
   if (cfg.batch_max_lines < 1 || cfg.batch_max_lines > 500) throw new PlanError('batch_max_lines 必须在 1..500 之间。');
   if (cfg.batch_max_source_tokens < 50) throw new PlanError('batch_max_source_tokens 至少 50。');
   if (cfg.session_max_source_tokens < 50) throw new PlanError('session_max_source_tokens 至少 50。');
-  if (cfg.concurrency < 1 || cfg.concurrency > 16) throw new PlanError('concurrency 必须在 1..16 之间。');
+  if (cfg.session_max_source_tokens < cfg.batch_max_source_tokens) {
+    throw new PlanError('session_max_source_tokens 不能小于 batch_max_source_tokens。');
+  }
+  if (cfg.concurrency < 1 || cfg.concurrency > MAX_CLOUD_CONCURRENCY) {
+    throw new PlanError(`concurrency 必须在 1..${MAX_CLOUD_CONCURRENCY} 之间。`);
+  }
 
   const existing = readPlan(workspace) || {};
   const history = Array.isArray(existing.config_history) ? [...existing.config_history] : [];
@@ -1251,14 +1364,16 @@ export function generateBatches(
   cfg: PlanConfig,
   options: { force?: boolean } = {}
 ): Record<string, unknown> {
+  const wsPaths = resolveWorkspacePaths(workspace);
   const family = resolveFamily(cfg.model, cfg.model_family);
-  const manifestPath = path.join(workspace, BATCHES_MANIFEST_REL);
+  const manifestPath = wsPaths.batchesManifestFile;
   if (!options.force && fs.existsSync(manifestPath)) {
-    // Allow regeneration when manifest doesn't exist or force is true; if force=false & exists, return or overwrite cleanly
-    // Wait: matches plan.py semantics (or refuses? In Step 15, work/batches doesn't exist initially).
+    throw new PlanError(
+      `工作区已存在批次清单（${BATCHES_MANIFEST_REL}），为避免覆盖导致与 ${WORKSPACE_WORK_OUT_REL}/ 已有译文错位，默认拒绝重新切分；如需重建请传 force=true。`
+    );
   }
 
-  const batchesDir = path.join(workspace, 'work', 'batches');
+  const batchesDir = wsPaths.batchesDir;
   fs.mkdirSync(batchesDir, { recursive: true });
   for (const ent of fs.readdirSync(batchesDir)) {
     if (ent.startsWith('batch_') && ent.endsWith('.jsonl')) {
@@ -1281,8 +1396,8 @@ export function generateBatches(
     const flush = () => {
       if (!chunk.length) return;
       const batchId = `batch_${String(batchIdx++).padStart(3, '0')}`;
-      const rel = `work/batches/${batchId}.jsonl`;
-      atomicWriteText(path.join(workspace, rel), chunk.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      const rel = wsPaths.batchInputRel(batchId);
+      atomicWriteText(wsPaths.batchInputFile(batchId), chunk.map((r) => JSON.stringify(r)).join('\n') + '\n');
       const est = estimateWithMargin(chunkTokens, cfg.margin_ratio);
       manifestBatches.push({
         batch_id: batchId,
@@ -1336,13 +1451,13 @@ export function generateBatches(
 }
 
 export function readBatchManifest(workspace: string): Record<string, unknown> {
-  const p = path.join(workspace, BATCHES_MANIFEST_REL);
+  const p = resolveWorkspacePaths(workspace).batchesManifestFile;
   if (isSymlinkPath(p) || !fs.existsSync(p) || !fs.statSync(p).isFile()) {
-    throw new BatchCheckinError('工作区还没有批次清单（work/batches/manifest.json）；先运行 vn_plan 生成批次。');
+    throw new BatchCheckinError(`工作区还没有批次清单（${BATCHES_MANIFEST_REL}）；先运行 vn_plan 生成批次。`);
   }
   const data = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '')) as Record<string, unknown>;
   if (!data || !Array.isArray(data.batches)) {
-    throw new BatchCheckinError('work/batches/manifest.json 格式无效。');
+    throw new BatchCheckinError(`${BATCHES_MANIFEST_REL} 格式无效。`);
   }
   return data;
 }
@@ -1358,7 +1473,10 @@ function stripFences(raw: string): string {
   return trimmed;
 }
 
-function computeProgressSummary(manifest: Record<string, unknown>, bMap: Record<string, unknown>): Record<string, number> {
+function computeProgressSummary(
+  manifest: Record<string, unknown>,
+  bMap: Record<string, unknown>
+): Record<string, unknown> {
   const manifestBatches = Array.isArray(manifest.batches) ? (manifest.batches as Array<Record<string, unknown>>) : [];
   const totalBatches = manifestBatches.length;
   const totalRows = Number(manifest.total_rows ?? 0);
@@ -1366,11 +1484,18 @@ function computeProgressSummary(manifest: Record<string, unknown>, bMap: Record<
   let qaPassed = 0;
   let qaFailed = 0;
   let checkedInRows = 0;
+  const routeTotals = {
+    tm_cache: 0,
+    local_mt: 0,
+    cloud_escalated: 0,
+    cloud_subagent: 0,
+  };
 
   for (const b of manifestBatches) {
     const id = String(b.batch_id || '');
     const entry = bMap[id] && typeof bMap[id] === 'object' ? (bMap[id] as Record<string, unknown>) : null;
     const status = String(entry?.status || '');
+    const isCheckedIn = status === 'saved_pending_qa' || status === 'qa_passed' || status === 'qa_failed';
     if (status === 'saved_pending_qa') {
       savedPendingQa++;
       checkedInRows += Number(entry?.rows ?? 0);
@@ -1380,6 +1505,20 @@ function computeProgressSummary(manifest: Record<string, unknown>, bMap: Record<
     } else if (status === 'qa_failed') {
       qaFailed++;
       checkedInRows += Number(entry?.rows ?? 0);
+    }
+    if (isCheckedIn) {
+      const rs =
+        entry?.route_stats && typeof entry.route_stats === 'object'
+          ? (entry.route_stats as Record<string, unknown>)
+          : null;
+      if (rs) {
+        routeTotals.tm_cache += Number(rs.tm_cache || 0);
+        routeTotals.local_mt += Number(rs.local_mt || 0);
+        routeTotals.cloud_escalated += Number(rs.cloud_escalated || 0);
+        routeTotals.cloud_subagent += Number(rs.cloud_subagent || 0);
+      } else {
+        routeTotals.cloud_subagent += Number(entry?.rows ?? 0);
+      }
     }
   }
 
@@ -1391,13 +1530,22 @@ function computeProgressSummary(manifest: Record<string, unknown>, bMap: Record<
     qa_failed: qaFailed,
     pending_batches: Math.max(0, totalBatches - savedPendingQa - qaPassed - qaFailed),
     checked_in_rows: checkedInRows,
+    route_stats: routeTotals,
   };
 }
 
 export function checkinBatch(
   workspace: string,
   batchId: string,
-  options: { raw?: string | null; outputFile?: string | null; model?: string; sessionSeq?: number } = {}
+  options: {
+    raw?: string | null;
+    entries?: Array<{ id: string; target: string }>;
+    outputFile?: string | null;
+    model?: string;
+    sessionSeq?: number;
+    mode?: TranslatorMode;
+    routeStats?: BatchRouteStats;
+  } = {}
 ): {
   batch_id: string;
   track: string;
@@ -1420,25 +1568,31 @@ export function checkinBatch(
     .filter((l) => l.trim())
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 
-  let rawOutput = '';
-  if (options.outputFile) {
-    rawOutput = fs.readFileSync(options.outputFile, 'utf8');
-  } else if (typeof options.raw === 'string') {
-    rawOutput = options.raw;
-  } else {
-    throw new BatchCheckinError('vn checkin 需要提供翻译输出内容。');
-  }
-
-  const cleaned = stripFences(rawOutput);
   const parsedOut: Array<{ id?: unknown; target?: unknown }> = [];
-  for (const line of cleaned.split(/\r?\n/)) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const obj = JSON.parse(t);
-      if (obj && typeof obj === 'object') parsedOut.push(obj as { id?: unknown; target?: unknown });
-    } catch {
-      throw new BatchCheckinError(`批次 ${batchId} 输出包含非 JSON 行：${t.slice(0, 120)}`);
+  if (Array.isArray(options.entries)) {
+    for (const item of options.entries) {
+      parsedOut.push({ id: item?.id, target: item?.target });
+    }
+  } else {
+    let rawOutput = '';
+    if (options.outputFile) {
+      rawOutput = fs.readFileSync(options.outputFile, 'utf8');
+    } else if (typeof options.raw === 'string') {
+      rawOutput = options.raw;
+    } else {
+      throw new BatchCheckinError('vn checkin 需要提供翻译输出内容。');
+    }
+
+    const cleaned = stripFences(rawOutput);
+    for (const line of cleaned.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const obj = JSON.parse(t);
+        if (obj && typeof obj === 'object') parsedOut.push(obj as { id?: unknown; target?: unknown });
+      } catch {
+        throw new BatchCheckinError(`批次 ${batchId} 输出包含非 JSON 行：${t.slice(0, 120)}`);
+      }
     }
   }
 
@@ -1468,14 +1622,15 @@ export function checkinBatch(
     });
   }
 
-  const outDir = path.join(workspace, 'work', 'out');
+  const wsPaths = resolveWorkspacePaths(workspace);
+  const outDir = wsPaths.workOutDir;
   fs.mkdirSync(outDir, { recursive: true });
-  const outPath = path.join(outDir, `${batchId}.jsonl`);
+  const outPath = wsPaths.batchOutFile(batchId);
   const outPayload = outRows.map((r) => JSON.stringify(r)).join('\n') + '\n';
   atomicWriteText(outPath, outPayload);
   const outSha = crypto.createHash('sha256').update(outPayload, 'utf8').digest('hex');
 
-  const progPath = path.join(workspace, PROGRESS_REL);
+  const progPath = wsPaths.progressFile;
   let progress: Record<string, unknown> = { schema: 1, batches: {} };
   if (fs.existsSync(progPath)) {
     try {
@@ -1485,6 +1640,14 @@ export function checkinBatch(
     }
   }
   const bMap = (progress.batches && typeof progress.batches === 'object' ? progress.batches : {}) as Record<string, unknown>;
+  const resolvedMode: TranslatorMode = options.mode ?? 'cloud_subagent';
+  const resolvedRouteStats: BatchRouteStats = options.routeStats ?? {
+    tm_cache: 0,
+    local_mt: 0,
+    cloud_escalated: 0,
+    cloud_subagent: outRows.length,
+    qa_failed: 0,
+  };
   bMap[batchId] = {
     batch_id: batchId,
     track,
@@ -1494,6 +1657,8 @@ export function checkinBatch(
     out_sha256: outSha,
     model: options.model || '',
     session_seq: options.sessionSeq || 0,
+    mode: resolvedMode,
+    route_stats: resolvedRouteStats,
     updated: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
   };
   progress.batches = bMap;
@@ -1517,7 +1682,8 @@ export function mergeTrackResults(
   track: string,
   profile: LocalizationProfile,
   memory: ProjectMemory,
-  requireAllBatches = true
+  requireAllBatches = true,
+  options: { homeDir?: string | null; controlPattern?: string | null } = {}
 ): {
   track: string;
   rows: number;
@@ -1526,11 +1692,16 @@ export function mergeTrackResults(
   results_path: string;
   results_sha256: string;
 } {
+  const controlPattern =
+    options.controlPattern !== undefined
+      ? options.controlPattern
+      : resolveWorkspaceControlPattern(workspace, options.homeDir);
   const manifest = readBatchManifest(workspace);
   const trackBatches = (manifest.batches as Array<Record<string, unknown>>).filter((b) => b.track === track);
   if (!trackBatches.length) throw new BatchCheckinError(`批次清单中没有 ${track} 轨道。`);
 
-  const progPath = path.join(workspace, PROGRESS_REL);
+  const wsPaths = resolveWorkspacePaths(workspace);
+  const progPath = wsPaths.progressFile;
   let progress: Record<string, unknown> = { schema: 1, batches: {} };
   if (fs.existsSync(progPath)) {
     try {
@@ -1542,14 +1713,17 @@ export function mergeTrackResults(
   const bMap = (progress.batches && typeof progress.batches === 'object' ? progress.batches : {}) as Record<string, unknown>;
 
   const mergedRows: Array<Record<string, unknown>> = [];
+  const rowBatchIds: string[] = [];
+  const batchFailedCounts = new Map<string, number>();
+  const batchRowCounts = new Map<string, number>();
   let passed = 0;
   let failed = 0;
 
   for (const b of trackBatches) {
     const batchId = String(b.batch_id);
-    const outPath = path.join(workspace, 'work', 'out', `${batchId}.jsonl`);
+    const outPath = wsPaths.batchOutFile(batchId);
     if (!fs.existsSync(outPath)) {
-      if (requireAllBatches) throw new BatchCheckinError(`批次 ${batchId} 尚未翻译入库（缺少 work/out/${batchId}.jsonl）。`);
+      if (requireAllBatches) throw new BatchCheckinError(`批次 ${batchId} 尚未翻译入库（缺少 ${wsPaths.batchOutRel(batchId)}）。`);
       continue;
     }
     const rows = fs
@@ -1559,9 +1733,10 @@ export function mergeTrackResults(
       .filter((l) => l.trim())
       .map((l) => JSON.parse(l) as Record<string, unknown>);
 
+    batchRowCounts.set(batchId, rows.length);
     let batchFailed = 0;
     for (const r of rows) {
-      const rep = qaReport(String(r.source || ''), String(r.target || ''), profile, memory.glossary);
+      const rep = qaReport(String(r.source || ''), String(r.target || ''), profile, memory.glossary, { controlPattern });
       const ok = !rep.blocked;
       if (ok) passed++;
       else {
@@ -1577,14 +1752,48 @@ export function mergeTrackResults(
         delete enriched.qa_errors;
       }
       mergedRows.push(enriched);
+      rowBatchIds.push(batchId);
     }
+    batchFailedCounts.set(batchId, batchFailed);
+  }
 
+  // Deterministic cross-row character name consistency verification across all merged rows in this track
+  const crossFindings = checkCrossRowNameConsistency(mergedRows, {
+    characters: memory.characters,
+    controlPattern,
+  });
+  if (crossFindings.size > 0) {
+    for (let i = 0; i < mergedRows.length; i++) {
+      const row = mergedRows[i];
+      const rowId = String(row.id ?? `row#${i}`);
+      const extra = crossFindings.get(rowId);
+      if (!extra || extra.length === 0) continue;
+      const prevFindings = Array.isArray(row.findings) ? (row.findings as QaFinding[]) : [];
+      const combined = [...prevFindings, ...extra];
+      const wasOk = row.ok === true;
+      const nowBlocked = combined.some((f) => f.severity === 'error');
+      row.findings = combined;
+      row.qa_errors = combined.filter((f) => f.severity === 'error').map((f) => `[${f.rule}] ${f.message}`);
+      if (wasOk && nowBlocked) {
+        row.ok = false;
+        passed = Math.max(0, passed - 1);
+        failed += 1;
+        const bId = rowBatchIds[i];
+        batchFailedCounts.set(bId, (batchFailedCounts.get(bId) ?? 0) + 1);
+      }
+    }
+  }
+
+  for (const b of trackBatches) {
+    const batchId = String(b.batch_id);
+    if (!batchRowCounts.has(batchId)) continue;
+    const batchFailed = batchFailedCounts.get(batchId) ?? 0;
     const existingEntry = (bMap[batchId] && typeof bMap[batchId] === 'object' ? bMap[batchId] : {}) as Record<string, unknown>;
     bMap[batchId] = {
       ...existingEntry,
       batch_id: batchId,
       track,
-      rows: rows.length,
+      rows: batchRowCounts.get(batchId) ?? 0,
       status: batchFailed > 0 ? 'qa_failed' : 'qa_passed',
       failed: batchFailed,
       updated: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
@@ -1596,9 +1805,9 @@ export function mergeTrackResults(
   progress.updated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   atomicWriteText(progPath, JSON.stringify(progress, null, 2) + '\n');
 
-  const resDir = path.join(workspace, 'results');
+  const resDir = wsPaths.resultsDir;
   fs.mkdirSync(resDir, { recursive: true });
-  const resultsPath = path.join(resDir, `${track}.jsonl`);
+  const resultsPath = wsPaths.resultsTrackFile(track);
   const payload = mergedRows.map((r) => JSON.stringify(r)).join('\n') + (mergedRows.length ? '\n' : '');
   atomicWriteText(resultsPath, payload);
   const sha = crypto.createHash('sha256').update(payload, 'utf8').digest('hex');

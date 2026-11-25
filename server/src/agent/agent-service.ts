@@ -5,6 +5,8 @@ import readline from 'node:readline';
 import { performance } from 'node:perf_hooks';
 import { EventEmitter } from 'node:events';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
+import type { Usage } from '@earendil-works/pi-ai';
+import { streamSimple as openAiCompletionsStreamSimple } from '@earendil-works/pi-ai/api/openai-completions';
 import {
   createAgentSession,
   ModelRuntime,
@@ -13,32 +15,183 @@ import {
   DefaultResourceLoader,
   loadSkills,
 } from '@earendil-works/pi-coding-agent';
+import {
+  clearReasoningOffFallbackCache,
+  wrapModelRuntimeWithReasoningOffFallback,
+} from './reasoning-effort-fallback.js';
 import { createVnTools } from './vn-tools.js';
+import { createReverserTools } from './reverser-tools.js';
 import {
   classifySubagentError,
   SubagentManager,
+  type SubagentCompactResult,
+  type SubagentQueueRestoredEvent,
+  type SubagentQueueUpdatedEvent,
+  type SubagentStreamDeltaEvent,
   type SubagentTaskSnapshot,
   type SubagentTaskSummary,
+  type SubagentUserSteerNote,
 } from '../subagents/subagent-manager.js';
-import { detectVnEngines, getVnStatus } from '../vn/core.js';
-import { realpathSafe } from '../vn/profile.js';
+import {
+  applyCompactionSettingsForModel,
+  computeCompactionThresholds,
+  createPaperCupCompactionExtension,
+  estimateRealProjectedContextTokens,
+  extractCompactionSummaryInfo,
+  hasPostUsageContextEdit,
+  isPaperCupContextOverflow,
+  readPaperCupCompactionConfig,
+  type CompactionReason,
+  type CompactionSummaryInfo,
+} from './compaction.js';
+import {
+  applyPaperCupQueueModes,
+  type PendingQueueState,
+  type QueuedMessageItem,
+  type QueuedMessageMode,
+  type QueueMutationResult,
+  type RestoredDraftPayload,
+  SessionQueueController,
+} from './message-queue.js';
+import {
+  type ChatImageAttachment,
+  DEFAULT_IMAGE_ONLY_PROMPT,
+  extractImagesFromContent,
+  inferCustomModelInputModalities,
+  modelSupportsImageInput,
+  summarizeUserMessagePreview,
+  toPiImageContents,
+  validateAndNormalizeImageAttachments,
+} from './image-attachments.js';
+import { detectVnEngineSummary, getVnStatus } from '../vn/core.js';
+import {
+  WORKSPACE_BATCHES_MANIFEST_REL,
+  WORKSPACE_CHECKPOINTS_REL,
+  WORKSPACE_PLAN_REL,
+  WORKSPACE_POST_QA_REPORT_REL,
+  WORKSPACE_POST_QA_STATE_REL,
+  WORKSPACE_PROGRESS_REL,
+  resolveWorkspacePaths,
+} from '../vn/workspace-paths.js';
+import { detectModelFamily, estimateTextTokens } from '../vn/tokens.js';
+import { collectDeduplicatedSkillDirs } from '../vn/skill-registry.js';
+import {
+  loadWorkspaceTranslatorOverride,
+  realpathSafe,
+  type CharacterRosterStore,
+  type TranslatorOverrideConfig,
+} from '../vn/profile.js';
+import {
+  buildCharacterFormConfirmationMessage,
+  cancelChatForm,
+  listChatForms,
+  readCharacterRoster,
+  submitCharacterConfirmationForm,
+  type CharacterConfirmationSubmissionItem,
+  type ChatFormRecord,
+} from '../vn/roster.js';
+import {
+  DEFAULT_SMOKE_CONFIG,
+  inspectSmokeTools,
+  loadGlobalSmokeConfig,
+  loadWorkspaceSmokeOverride,
+  mergeSmokeConfig,
+  normalizeSmokeConfig,
+  readSmokeReport,
+  saveGlobalSmokeConfig,
+  type SmokeConfigState,
+  type SmokeReport,
+  type SmokeTestConfig,
+} from '../vn/smoke-config.js';
+import type { SmokeExecutionDriver } from '../vn/smoke.js';
+import {
+  DEFAULT_LOCAL_TRANSLATOR_CONFIG,
+  LOCAL_ENDPOINT_PRESETS,
+  LocalTranslatorEndpointError,
+  mergeTranslatorConfig,
+  normalizeTranslatorConfig,
+  pickPreferredLocalModel,
+  probeLocalTranslatorEndpoint,
+  toPublicTranslatorConfig,
+  type LocalEndpointPresetInfo,
+  type LocalProbeModel,
+  type LocalProbeResult,
+  type LocalTranslatorConfig,
+  type LocalUsageDelta,
+  type PublicLocalTranslatorConfig,
+} from './local-translator.js';
+import {
+  detectLocalOllamaOrigin,
+  getLocalOllamaStatus,
+  isLocalOllamaCandidate,
+  isLoopbackHostname,
+  syncLocalOllamaConcurrency,
+  type OllamaStatusResult,
+  type OllamaSyncFn,
+  type OllamaSyncResult,
+} from './ollama-sync.js';
 import { PAPERCUP_SYSTEM_PROMPT } from './prompt.js';
 import {
+  pickFileNative,
   pickFolderNative,
+  type FilePickerFn,
   type FolderPickerFn,
   type FolderPickResult,
 } from './folder-picker.js';
 import {
+  DEFAULT_MAGPIE_BASE_URL,
+  MAGPIE_KEYLESS_RUNTIME_TOKEN,
   discoverProviderAndModels,
+  inferContextWindowFromModelId,
   isSupportedLiveChatModel,
+  normalizeMagpieBaseUrl,
+  resolveDefaultMagpieBaseUrl,
   type DetectionMethod,
   type DiscoveredLiveModel,
   type ProviderProbeFetch,
 } from './provider-discovery.js';
+import {
+  collectPersistedSecrets,
+  createEmptyPersistedAuthState,
+  loadPersistedAuthState,
+  savePersistedAuthState,
+  type PersistedApiAuthState,
+} from './auth-store.js';
 import { WorkspaceManager, WorkspaceRegistry } from './workspace-manager.js';
 import { config, resolvePapercupConfigDir } from '../config.js';
-import { createGuardedBuiltinToolDefinitions } from '../security/guarded-tools.js';
+import {
+  createGuardedBuiltinToolDefinitions,
+  DEFAULT_MAIN_BASH_MAX_TIMEOUT_SEC,
+  readVnResearchConfig,
+} from '../security/guarded-tools.js';
 import { redactSecrets, redactUnknownValue } from '../security/secrets.js';
+
+export class AppError extends Error {
+  readonly status: number;
+  readonly code?: string;
+
+  constructor(message: string, status = 400, code?: string) {
+    super(message);
+    this.name = 'AppError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const DELIVERY_MODE_CUSTOM_TYPE = 'papercup_user_delivery_mode';
+
+function createKeylessFetchWrapper(baseFetch?: typeof fetch): typeof fetch {
+  const targetFetch = baseFetch ?? globalThis.fetch;
+  return (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const nextInit: RequestInit = { ...(init ?? {}) };
+    const headers = new Headers(
+      nextInit.headers ?? (input instanceof Request ? input.headers : undefined)
+    );
+    headers.delete('authorization');
+    nextInit.headers = headers;
+    return targetFetch(input, nextInit);
+  };
+}
 
 export interface AgentEvent {
   type: string;
@@ -52,6 +205,7 @@ export interface ModelOption {
   id: string;
   name: string;
   reasoning: boolean;
+  supportsImage?: boolean;
 }
 
 export type ProviderAuthSource = 'runtime' | 'stored' | 'environment' | null;
@@ -62,7 +216,13 @@ export interface ProviderStatusInfo {
   envVar?: string;
   configured: boolean;
   source: ProviderAuthSource;
+  savedLocally?: boolean;
   modelCount: number;
+  baseUrl?: string;
+  defaultBaseUrl?: string;
+  supportsBaseUrl?: boolean;
+  apiKeyOptional?: boolean;
+  hasApiKey?: boolean;
 }
 
 const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = [
@@ -89,7 +249,7 @@ interface FeaturedProviderMeta {
   envVar: string;
 }
 
-type CustomOpenAIProviderId = 'modelscope' | 'volcengine' | 'siliconflow';
+type CustomOpenAIProviderId = 'modelscope' | 'volcengine' | 'siliconflow' | 'magpie';
 
 interface CustomOpenAIPreset {
   id: string;
@@ -101,22 +261,28 @@ interface CustomOpenAIProviderSpec {
   id: CustomOpenAIProviderId;
   name: string;
   envVar: string;
+  baseUrlEnvVar?: string;
+  modelEnvVar?: string;
   baseUrl: string;
   catalogUrl: string;
-  thinkingFormat: 'qwen' | 'deepseek';
+  thinkingFormat: 'qwen' | 'deepseek' | 'openai';
+  supportsReasoningEffort?: boolean;
+  supportsBaseUrl?: boolean;
+  apiKeyOptional?: boolean;
+  resolveDefaultBaseUrl?: () => string;
+  normalizeBaseUrl?: (raw?: string | null, fallback?: string) => string;
   resolveApiKeyRef: () => string;
   inferReasoning: (id: string) => boolean;
+  inferInput?: (id: string) => ('text' | 'image')[];
   requiresMandatoryThinking?: (id: string) => boolean;
   requiresReasoningContent: (id: string) => boolean;
-  filterLiveModel: (id: string, entry: any) => boolean;
+  requiresToolsWithToolHistory?: (id: string) => boolean;
   presets: readonly CustomOpenAIPreset[];
 }
 
 const MODELSCOPE_BASE_URL = 'https://api-inference.modelscope.cn/v1';
 const VOLCENGINE_ARK_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 const SILICONFLOW_BASE_URL = 'https://api.siliconflow.cn/v1';
-
-const NON_CHAT_LIVE_MODEL_RE = /(?:seedream|seedance|embedding|embed|rerank|whisper|tts|asr|audio|speech|video|image-edit|text-to-image|image-to-image|stable-diffusion|flux|kolors|cosyvoice|fish-speech|sensevoice|wan2|cogvideo|hunyuanvideo|t2i|i2v|t2v)/i;
 
 const CUSTOM_OPENAI_PROVIDERS: Record<CustomOpenAIProviderId, CustomOpenAIProviderSpec> = {
   modelscope: {
@@ -128,8 +294,8 @@ const CUSTOM_OPENAI_PROVIDERS: Record<CustomOpenAIProviderId, CustomOpenAIProvid
     thinkingFormat: 'qwen',
     resolveApiKeyRef: () => '$MODELSCOPE_API_KEY',
     inferReasoning: () => true,
+    inferInput: inferCustomModelInputModalities,
     requiresReasoningContent: (id) => id.toLowerCase().includes('deepseek'),
-    filterLiveModel: (id) => !/image-edit/i.test(id),
     presets: [
       { id: 'Qwen/Qwen3.8-Flash-Next', name: 'Qwen3.8 Flash Next', reasoning: true },
       { id: 'Qwen/Qwen3.8-27B', name: 'Qwen3.8 27B', reasoning: true },
@@ -172,19 +338,12 @@ const CUSTOM_OPENAI_PROVIDERS: Record<CustomOpenAIProviderId, CustomOpenAIProvid
       }
       return /(?:doubao-seed|thinking|reasoner|deepseek-r1|deepseek-v3[.-][12]|deepseek-v4|kimi-k2|glm-4[.-][5-9]|glm-[5-9])/.test(lower);
     },
+    inferInput: inferCustomModelInputModalities,
     requiresMandatoryThinking: (id) =>
       /(?:deepseek-r1|kimi-k2-thinking)/i.test(id),
     requiresReasoningContent: (id) => {
       const lower = id.toLowerCase();
       return lower.includes('deepseek') || lower.includes('doubao-seed') || lower.includes('kimi') || lower.includes('glm');
-    },
-    filterLiveModel: (id, entry) => {
-      if (NON_CHAT_LIVE_MODEL_RE.test(id)) return false;
-      const domain = typeof entry?.domain === 'string' ? entry.domain : '';
-      const taskType = typeof entry?.task_type === 'string' ? entry.task_type : '';
-      if (domain && NON_CHAT_LIVE_MODEL_RE.test(domain)) return false;
-      if (taskType && NON_CHAT_LIVE_MODEL_RE.test(taskType)) return false;
-      return true;
     },
     presets: [
       { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro', reasoning: true },
@@ -213,13 +372,8 @@ const CUSTOM_OPENAI_PROVIDERS: Record<CustomOpenAIProviderId, CustomOpenAIProvid
       }
       return /(?:thinking|reasoner|qwq|deepseek-r1|deepseek-v3[.-][12]|deepseek-v4|qwen3|glm-z1|glm-4[.-][5-9]|glm-[5-9]|kimi-k2[.-]5|kimi-k3|minimax-m|hunyuan-a13b)/.test(lower);
     },
+    inferInput: inferCustomModelInputModalities,
     requiresReasoningContent: (id) => id.toLowerCase().includes('deepseek'),
-    filterLiveModel: (id, entry) => {
-      if (NON_CHAT_LIVE_MODEL_RE.test(id)) return false;
-      const subType = typeof entry?.sub_type === 'string' ? entry.sub_type.toLowerCase() : '';
-      if (subType && subType !== 'chat') return false;
-      return true;
-    },
     presets: [
       { id: 'deepseek-ai/DeepSeek-V3.2', name: 'DeepSeek V3.2', reasoning: true },
       { id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3', reasoning: false },
@@ -234,6 +388,41 @@ const CUSTOM_OPENAI_PROVIDERS: Record<CustomOpenAIProviderId, CustomOpenAIProvid
       { id: 'moonshotai/Kimi-K2-Thinking', name: 'Kimi K2 Thinking', reasoning: true },
     ],
   },
+  magpie: {
+    id: 'magpie',
+    name: 'Magpie (本地网关)',
+    envVar: 'MAGPIE_API_KEY',
+    baseUrlEnvVar: 'MAGPIE_BASE_URL',
+    modelEnvVar: 'MAGPIE_MODEL',
+    baseUrl: DEFAULT_MAGPIE_BASE_URL,
+    catalogUrl: `${DEFAULT_MAGPIE_BASE_URL}/models`,
+    thinkingFormat: 'openai',
+    supportsReasoningEffort: true,
+    supportsBaseUrl: true,
+    apiKeyOptional: true,
+    resolveDefaultBaseUrl: resolveDefaultMagpieBaseUrl,
+    normalizeBaseUrl: normalizeMagpieBaseUrl,
+    resolveApiKeyRef: () =>
+      !process.env.MAGPIE_API_KEY && process.env.MAGPIE_BASE_URL?.trim()
+        ? MAGPIE_KEYLESS_RUNTIME_TOKEN
+        : '$MAGPIE_API_KEY',
+    inferReasoning: (id) => {
+      const lower = id.toLowerCase();
+      if (/(?:chat-latest|non-thinking)/i.test(lower)) {
+        return false;
+      }
+      if (/(?:instruct|coder)/i.test(lower) && !/(?:thinking|reasoner|deepseek-r1|qwq|gpt-5|gpt-6)/i.test(lower)) {
+        return false;
+      }
+      return /(?:^|[-_./])(?:reason|reasoner|thinking|qwq|deepseek-r1|deepseek-v3[.-][12]|deepseek-v4|r1-distill|gpt-5|gpt-6|o1|o3|o4|claude-3[.-]7|claude-(?:opus|sonnet|haiku|fable)-(?:4|5)|gemini-(?:2\.5|3|4)|grok-4|qwen3|doubao-seed|kimi-k2[.-]5|kimi-k3|glm-(?:4\.[5-9]|5|z1)|minimax-m)/i.test(
+        lower
+      );
+    },
+    inferInput: inferCustomModelInputModalities,
+    requiresReasoningContent: (id) => /(?:deepseek|kimi|glm|doubao-seed)/i.test(id),
+    requiresToolsWithToolHistory: (id) => id.toLowerCase().includes('claude'),
+    presets: [],
+  },
 };
 
 const CUSTOM_OPENAI_PROVIDER_LIST: readonly CustomOpenAIProviderSpec[] = Object.values(CUSTOM_OPENAI_PROVIDERS);
@@ -246,29 +435,40 @@ function buildCustomOpenAIModelDefinition(
   spec: CustomOpenAIProviderSpec,
   id: string,
   name?: string,
-  reasoningOverride?: boolean
+  reasoningOverride?: boolean,
+  baseUrlOverride?: string,
+  contextWindowOverride?: number
 ) {
   const reasoning = reasoningOverride ?? spec.inferReasoning(id);
   const mandatoryThinking = reasoning && Boolean(spec.requiresMandatoryThinking?.(id));
+  const input: ('text' | 'image')[] = spec.inferInput ? spec.inferInput(id) : ['text'];
+  const inferredCtx = inferContextWindowFromModelId(id);
+  const contextWindow =
+    typeof contextWindowOverride === 'number' &&
+    Number.isFinite(contextWindowOverride) &&
+    contextWindowOverride >= 2048
+      ? Math.floor(contextWindowOverride)
+      : inferredCtx ?? 131072;
   return {
     id,
     name: name ?? id,
     type: 'chat' as const,
     api: 'openai-completions' as const,
     provider: spec.id,
-    baseUrl: spec.baseUrl,
+    baseUrl: baseUrlOverride ?? spec.baseUrl,
     reasoning,
     ...(mandatoryThinking ? { thinkingLevelMap: { off: null } } : {}),
-    input: ['text'] as ('text' | 'image')[],
+    input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 131072,
+    contextWindow,
     maxTokens: 16384,
     compat: {
       supportsStore: false,
       supportsDeveloperRole: false,
-      supportsReasoningEffort: false,
+      supportsReasoningEffort: Boolean(spec.supportsReasoningEffort),
       supportsLongCacheRetention: false,
       requiresReasoningContentOnAssistantMessages: reasoning && spec.requiresReasoningContent(id),
+      ...(spec.requiresToolsWithToolHistory?.(id) ? { requiresToolsWithToolHistory: true } : {}),
       maxTokensField: 'max_tokens' as const,
       supportsStrictMode: false,
       thinkingFormat: spec.thinkingFormat,
@@ -286,6 +486,7 @@ const DEFAULT_CUSTOM_PROVIDER_MODELS: Record<CustomOpenAIProviderId, any[]> = {
   siliconflow: CUSTOM_OPENAI_PROVIDERS.siliconflow.presets.map((p) =>
     buildCustomOpenAIModelDefinition(CUSTOM_OPENAI_PROVIDERS.siliconflow, p.id, p.name, p.reasoning)
   ),
+  magpie: [],
 };
 
 const FEATURED_PROVIDERS: readonly FeaturedProviderMeta[] = [
@@ -298,6 +499,7 @@ const FEATURED_PROVIDERS: readonly FeaturedProviderMeta[] = [
   { id: 'modelscope', name: 'ModelScope (魔搭)', envVar: 'MODELSCOPE_API_KEY' },
   { id: 'volcengine', name: '火山方舟 (Volcengine Ark)', envVar: 'ARK_API_KEY' },
   { id: 'siliconflow', name: 'SiliconFlow (硅基流动)', envVar: 'SILICONFLOW_API_KEY' },
+  { id: 'magpie', name: 'Magpie (本地网关)', envVar: 'MAGPIE_API_KEY' },
   { id: 'groq', name: 'Groq', envVar: 'GROQ_API_KEY' },
   { id: 'moonshotai', name: 'Moonshot (Kimi)', envVar: 'MOONSHOT_API_KEY' },
   { id: 'minimax', name: 'MiniMax', envVar: 'MINIMAX_API_KEY' },
@@ -309,7 +511,47 @@ export type TurnPhase = 'connecting' | 'retrying' | 'thinking' | 'tool' | 'gener
 export interface AgentServiceOptions {
   sessionMode?: SessionMode;
   folderPicker?: FolderPickerFn;
+  filePicker?: FilePickerFn;
   probeFetch?: ProviderProbeFetch;
+  localTranslatorFetch?: typeof fetch;
+  ollamaSyncer?: OllamaSyncFn;
+  smokeDriver?: SmokeExecutionDriver;
+}
+
+export interface TranslatorConfigState {
+  global: PublicLocalTranslatorConfig;
+  workspaceOverride: TranslatorOverrideConfig | null;
+  effective: PublicLocalTranslatorConfig;
+  endpointPresets: readonly LocalEndpointPresetInfo[];
+}
+
+export interface TranslatorConfigUpdateResult extends TranslatorConfigState {
+  ollamaSync?: OllamaSyncResult;
+}
+
+export interface TranslatorProbeResult extends LocalProbeResult {
+  suggestedModel: string | null;
+  ollamaAutoStarted?: boolean;
+  ollamaVersion?: string;
+  ollamaManaged?: boolean;
+  ollamaSyncSeq?: number;
+}
+
+export interface TranslatorConfigUpdateInput {
+  mode?: 'cloud_subagent' | 'local_mt';
+  baseUrl?: string;
+  model?: string;
+  ollamaPath?: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  preset?: 'sakura' | 'hy-mt' | 'plain-lines';
+  packetLines?: number;
+  concurrency?: number;
+  contextWindow?: number;
+  timeoutMs?: number;
+  escalateFailedRows?: boolean;
+  useTmCache?: boolean;
+  disableThinking?: boolean;
 }
 
 export interface ApiKeyUpdateResult extends ModelsState {
@@ -332,6 +574,56 @@ export interface ApiKeyDetectPreview {
 const MAX_HISTORY_TOOL_RESULT_TEXT_CHARS = 4096;
 const ENGINEERING_STATUS_CACHE_TTL_MS = 15_000;
 const SUBAGENT_TASKS_HISTORY_LIMIT = 80;
+
+function toSafeNonNegInt(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+function toSafeNonNegNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function createEmptyTokenBucket(): TokenUsageBucket {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    calls: 0,
+  };
+}
+
+function addUsageToBucket(
+  bucket: TokenUsageBucket,
+  rawUsage: any,
+  options?: { estimated?: boolean; countCall?: boolean }
+): void {
+  if (!rawUsage || typeof rawUsage !== 'object') return;
+  const input = toSafeNonNegInt(rawUsage.input);
+  const output = toSafeNonNegInt(rawUsage.output);
+  const cacheRead = toSafeNonNegInt(rawUsage.cacheRead);
+  const cacheWrite = toSafeNonNegInt(rawUsage.cacheWrite);
+  const rawTotal = toSafeNonNegInt(rawUsage.totalTokens);
+  const entryTotal = rawTotal > 0 ? rawTotal : input + output + cacheRead + cacheWrite;
+
+  bucket.input += input;
+  bucket.output += output;
+  bucket.cacheRead += cacheRead;
+  bucket.cacheWrite += cacheWrite;
+  bucket.totalTokens += entryTotal;
+
+  const rawReasoning = rawUsage.reasoning ?? rawUsage.reasoningTokens;
+  if (typeof rawReasoning === 'number' && Number.isFinite(rawReasoning) && rawReasoning >= 0) {
+    bucket.reasoningTokens = (bucket.reasoningTokens ?? 0) + Math.round(rawReasoning);
+  }
+  if (options?.countCall !== false) {
+    bucket.calls += 1;
+  }
+  if (options?.estimated) {
+    bucket.estimated = true;
+  }
+}
 
 const PROVIDER_API_PRELOADERS: Record<string, () => Promise<unknown>> = {
   'openai-completions': () => import('@earendil-works/pi-ai/api/openai-completions'),
@@ -362,6 +654,8 @@ const HISTORY_TOOL_DETAIL_KEYS = [
   'ok',
   'rejected',
   'engine',
+  'chatFormId',
+  'chatFormKind',
 ] as const;
 
 function truncateToolResultForHistory(
@@ -423,12 +717,30 @@ export interface PersistedToolCall {
 
 export interface PersistedChatMessage {
   id: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'compaction';
   content: string;
+  images?: ChatImageAttachment[];
   thinking?: string;
   tools?: PersistedToolCall[];
   timestamp: string;
   error?: boolean;
+  deliveryMode?: QueuedMessageMode;
+  compaction?: {
+    reason: CompactionReason;
+    tokensBefore: number;
+    tokensAfter: number;
+    focus?: string;
+    checkpointPath?: string;
+  };
+}
+
+export interface CompactSessionResult {
+  ok: true;
+  status: 'compacted' | 'noop' | 'queued';
+  result?: CompactionSummaryInfo;
+  message?: string;
+  tokenUsage?: SessionTokenUsageSnapshot;
+  focus?: string;
 }
 
 export interface ActiveTurnSnapshot {
@@ -444,11 +756,61 @@ export interface ActiveTurnSnapshot {
   startedAt: string;
 }
 
+export interface TokenUsageBucket {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+  calls: number;
+  estimated?: boolean;
+}
+
+export interface SessionTokenUsageSnapshot {
+  sessionId: string | null;
+  total: TokenUsageBucket;
+  cloud: TokenUsageBucket;
+  local: TokenUsageBucket;
+  breakdown: {
+    main: TokenUsageBucket;
+    cloudTranslator: TokenUsageBucket;
+    cloudEscalation: TokenUsageBucket;
+    roleChecker: TokenUsageBucket;
+    reverser: TokenUsageBucket;
+    smokeVision: TokenUsageBucket;
+    otherSubagents: TokenUsageBucket;
+    compaction: TokenUsageBucket;
+    localMt: TokenUsageBucket;
+  };
+  currentTurn: {
+    cloud: TokenUsageBucket;
+    local: TokenUsageBucket;
+    totalTokens: number;
+    live: boolean;
+  };
+  contextUsage: {
+    tokens: number | null;
+    contextWindow: number;
+    percent: number | null;
+    triggerTokens?: number;
+  } | null;
+  translatorMode: 'cloud_subagent' | 'local_mt';
+  cloudCostUsd: number;
+  updatedAt: string;
+}
+
 export interface TurnSyncState {
   isRunning: boolean;
+  isCompacting: boolean;
+  queuedCompaction: { focus?: string } | null;
   sessionId: string | null;
   activeTurn: ActiveTurnSnapshot | null;
+  pendingQueue: PendingQueueState;
+  activeDirectSubagentTaskId?: string | null;
   subagentTasks: SubagentTaskSummary[];
+  tokenUsage: SessionTokenUsageSnapshot;
+  chatForms?: ChatFormRecord[];
 }
 
 export interface SessionSummary {
@@ -466,8 +828,14 @@ export interface SessionHistoryState {
   messages: PersistedChatMessage[];
   sessions: SessionSummary[];
   isRunning: boolean;
+  isCompacting: boolean;
+  queuedCompaction: { focus?: string } | null;
   activeTurn: ActiveTurnSnapshot | null;
+  pendingQueue: PendingQueueState;
+  activeDirectSubagentTaskId?: string | null;
   subagentTasks: SubagentTaskSummary[];
+  tokenUsage: SessionTokenUsageSnapshot;
+  chatForms?: ChatFormRecord[];
 }
 
 interface MemorySessionRecord {
@@ -490,8 +858,26 @@ export class AgentService extends EventEmitter {
   private activeWorkspace: string;
   private sessionMode: SessionMode;
   private folderPicker: FolderPickerFn;
+  private filePicker: FilePickerFn;
   private probeFetch?: ProviderProbeFetch;
+  private localTranslatorFetch?: typeof fetch;
+  private ollamaSyncer?: OllamaSyncFn;
+  private smokeDriver?: SmokeExecutionDriver;
+  private translatorConfig: LocalTranslatorConfig = { ...DEFAULT_LOCAL_TRANSLATOR_CONFIG };
+  private smokeConfig: SmokeTestConfig = { ...DEFAULT_SMOKE_CONFIG };
   private pickFolderInFlight: Promise<FolderPickResult> | null = null;
+  private pickOllamaInFlight: Promise<FolderPickResult> | null = null;
+  private pickSmokeToolInFlight: Promise<FolderPickResult> | null = null;
+  private ollamaEnsureInFlight: Promise<OllamaSyncResult> | null = null;
+  private syncSeq = 0;
+  private lastOllamaRuntime: {
+    origin: string;
+    running: boolean;
+    version?: string;
+    managedByPaperCup: boolean;
+    concurrency?: number;
+    checkedAt: number;
+  } | null = null;
   private currentSession: any = null;
   private initSessionPromise: Promise<void> | null = null;
   private sessionEpoch = 0;
@@ -500,14 +886,32 @@ export class AgentService extends EventEmitter {
   private sharedModelRuntimePromise: Promise<any> | null = null;
   private customProvidersInitialized = false;
   private resourceLoader: DefaultResourceLoader | null = null;
+  private settingsManager: SettingsManager | null = null;
   private subagentManager = new SubagentManager();
   private isRunningTurn = false;
+  private isCompacting = false;
+  private queuedMainCompaction: { focus?: string } | null = null;
+  private pendingManualCompactionFocus: string | undefined = undefined;
+  private pendingCompactionReasonOverride: CompactionReason | undefined = undefined;
+  private lastCompletedCompactionInfo: CompactionSummaryInfo | null = null;
+  private turnOverflowCompactionAttempted = false;
+  private turnLock = false;
+  private directSubagentLock = false;
   private turnAborted = false;
   private activeTurnAbortController: AbortController | null = null;
   private activeTurnSnapshot: ActiveTurnSnapshot | null = null;
+  private activeDirectSubagentTaskId: string | null = null;
+  private activeDirectSubagentAbortController: AbortController | null = null;
   private activeTurnPrompt = '';
+  private activeTurnImages: ChatImageAttachment[] = [];
   private activeTurnStartedAtLabel = '';
   private turnBaseMessageCount = 0;
+  private mainQueueController = new SessionQueueController();
+  private activeTurnCommittedMessages: PersistedChatMessage[] = [];
+  private activeTurnUserMsgCount = 0;
+  private activeTurnCommitSeq = 0;
+  private activeTurnRestoredDraft: RestoredDraftPayload | null = null;
+  private deliveredUserModes = new Map<string, QueuedMessageMode>();
   private turnTiming: {
     startedAt: number;
     promptCalledAt: number;
@@ -516,9 +920,12 @@ export class AgentService extends EventEmitter {
     modelKey: string;
   } | null = null;
   private pendingSkillReload = false;
+  private persistedAuth: PersistedApiAuthState = createEmptyPersistedAuthState();
   private preferredModelKey: string | null = null;
   private preferredThinkingLevel: ThinkingLevel | null = null;
   private runtimeApiKeys = new Map<string, string>();
+  private keylessRuntimeProviders = new Set<string>();
+  private customProviderBaseUrls = new Map<CustomOpenAIProviderId, string>();
   private clearedProviders = new Set<string>();
   private liveCustomProviderModels = new Map<CustomOpenAIProviderId, any[]>();
   private customProviderModels = new Map<CustomOpenAIProviderId, Map<string, any>>();
@@ -530,6 +937,9 @@ export class AgentService extends EventEmitter {
   private sessionFileMetaCache = new Map<string, CachedSessionFileMeta>();
   private memorySeq = 0;
   private lastTurnError: string | undefined;
+  private turnUsageStartEntryIndex = 0;
+  private inFlightMainStreamText = '';
+  private lastLiveUsageEmitMs = 0;
 
   private workspaceKey(workspace: string): string {
     const resolved = path.resolve(workspace);
@@ -549,7 +959,34 @@ export class AgentService extends EventEmitter {
   private disposeCurrentSessionState(clearManager: boolean): void {
     this.sessionEpoch += 1;
     this.initSessionPromise = null;
+    this.turnUsageStartEntryIndex = 0;
+    this.inFlightMainStreamText = '';
+    this.lastLiveUsageEmitMs = 0;
+    this.mainQueueController.reset();
+    this.activeTurnCommittedMessages = [];
+    this.activeTurnUserMsgCount = 0;
+    this.activeTurnCommitSeq = 0;
+    this.activeTurnRestoredDraft = null;
+    this.isCompacting = false;
+    this.queuedMainCompaction = null;
+    this.pendingManualCompactionFocus = undefined;
+    this.pendingCompactionReasonOverride = undefined;
+    this.lastCompletedCompactionInfo = null;
+    this.turnOverflowCompactionAttempted = false;
+    this.settingsManager = null;
+    if (this.activeDirectSubagentTaskId) {
+      const reason = '会话或工作区已切换，已中止子代理对话。';
+      this.activeDirectSubagentAbortController?.abort(reason);
+      this.subagentManager.abortTask(this.activeDirectSubagentTaskId, reason);
+      this.activeDirectSubagentTaskId = null;
+      this.activeDirectSubagentAbortController = null;
+    }
     if (this.currentSession) {
+      try {
+        this.currentSession.clearQueue?.();
+      } catch {
+        // Ignore queue cleanup error on dispose
+      }
       try {
         this.currentSession.dispose?.();
       } catch (e) {
@@ -560,6 +997,7 @@ export class AgentService extends EventEmitter {
       this.pendingSkillReload = false;
     }
     if (clearManager) {
+      this.subagentManager.disposeResumableSessions(this.activeWorkspace);
       this.sessionManager = null;
     }
   }
@@ -609,15 +1047,18 @@ export class AgentService extends EventEmitter {
   }
 
   isBusy(): boolean {
-    return this.isRunningTurn;
+    return (
+      this.isRunningTurn ||
+      this.turnLock ||
+      this.isCompacting ||
+      this.directSubagentLock ||
+      Boolean(this.activeDirectSubagentTaskId)
+    );
   }
 
   private collectSkillPaths(): string[] {
     const globalConfigDir = this.resolveGlobalConfigDir();
-    return [
-      path.join(this.activeWorkspace, '.papercup', 'skills'),
-      path.join(globalConfigDir, 'skills'),
-    ].filter((dir) => fs.existsSync(dir));
+    return collectDeduplicatedSkillDirs(this.activeWorkspace, { homeDir: globalConfigDir });
   }
 
   private invalidateEngineeringStatusCache(workspace?: string): void {
@@ -641,19 +1082,10 @@ export class AgentService extends EventEmitter {
 
   private listEngineSkills(): string[] {
     const names = new Set<string>();
-    for (const root of this.collectSkillPaths()) {
-      try {
-        for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-          if (
-            entry.isDirectory() &&
-            entry.name.startsWith('engine-') &&
-            fs.existsSync(path.join(root, entry.name, 'SKILL.md'))
-          ) {
-            names.add(entry.name);
-          }
-        }
-      } catch {
-        // Ignore unreadable skill directories
+    for (const skillDir of this.collectSkillPaths()) {
+      const name = path.basename(skillDir);
+      if (name.startsWith('engine-')) {
+        names.add(name);
       }
     }
     return Array.from(names).sort();
@@ -663,7 +1095,44 @@ export class AgentService extends EventEmitter {
     super();
     this.sessionMode = options?.sessionMode ?? 'persist';
     this.folderPicker = options?.folderPicker ?? pickFolderNative;
+    this.filePicker = options?.filePicker ?? pickFileNative;
     this.probeFetch = options?.probeFetch;
+    this.localTranslatorFetch = options?.localTranslatorFetch;
+    this.ollamaSyncer = options?.ollamaSyncer;
+    this.smokeDriver = options?.smokeDriver;
+    this.translatorConfig = this.loadPersistedTranslatorConfig();
+    this.smokeConfig =
+      this.sessionMode === 'persist'
+        ? loadGlobalSmokeConfig(this.resolveGlobalConfigDir())
+        : { ...DEFAULT_SMOKE_CONFIG };
+    this.persistedAuth = this.loadPersistedAuth();
+    if (this.persistedAuth.preferredThinkingLevel) {
+      this.preferredThinkingLevel = this.persistedAuth.preferredThinkingLevel;
+    }
+    if (this.persistedAuth.preferredModel) {
+      this.preferredModelKey = this.persistedAuth.preferredModel;
+    }
+    for (const [pid, rec] of Object.entries(this.persistedAuth.providers)) {
+      if (isCustomOpenAIProviderId(pid)) {
+        const spec = CUSTOM_OPENAI_PROVIDERS[pid];
+        if (rec.baseUrl && spec.supportsBaseUrl) {
+          try {
+            const defaultUrl = spec.resolveDefaultBaseUrl?.() ?? spec.baseUrl;
+            const normalized = spec.normalizeBaseUrl
+              ? spec.normalizeBaseUrl(rec.baseUrl, defaultUrl)
+              : rec.baseUrl.replace(/\/+$/, '');
+            this.customProviderBaseUrls.set(pid, normalized);
+          } catch {
+            // Ignore invalid persisted baseUrl
+          }
+        }
+        if (Array.isArray(rec.customModels)) {
+          for (const cm of rec.customModels) {
+            this.registerCustomProviderModel(pid, cm);
+          }
+        }
+      }
+    }
     const resolvedInitial = initialWorkspace ? path.resolve(initialWorkspace) : undefined;
     this.workspaceManager = new WorkspaceManager({
       configDir: this.resolveGlobalConfigDir(),
@@ -707,6 +1176,542 @@ export class AgentService extends EventEmitter {
     return '';
   }
 
+  private *getAllKnownSecrets(): Iterable<string> {
+    yield* this.runtimeApiKeys.values();
+    yield* collectPersistedSecrets(this.persistedAuth);
+    if (this.translatorConfig.apiKey.trim()) {
+      yield this.translatorConfig.apiKey.trim();
+    }
+  }
+
+  private resolveAuthConfigPath(): string {
+    return path.join(this.resolveGlobalConfigDir(), 'auth.json');
+  }
+
+  private loadPersistedAuth(): PersistedApiAuthState {
+    if (this.sessionMode !== 'persist') {
+      return createEmptyPersistedAuthState();
+    }
+    return loadPersistedAuthState(this.resolveAuthConfigPath());
+  }
+
+  private savePersistedAuth(): void {
+    if (this.sessionMode !== 'persist') {
+      return;
+    }
+    savePersistedAuthState(this.resolveAuthConfigPath(), this.persistedAuth);
+  }
+
+  private recordCustomModelInPersistedAuth(providerId: CustomOpenAIProviderId, cleanModelId: string): void {
+    if (this.sessionMode !== 'persist' || !cleanModelId) {
+      return;
+    }
+    const existing = this.persistedAuth.providers[providerId] ?? {};
+    const prevCustom = existing.customModels ?? [];
+    if (prevCustom.includes(cleanModelId)) {
+      return;
+    }
+    this.persistedAuth.providers[providerId] = {
+      ...existing,
+      customModels: [...prevCustom, cleanModelId],
+    };
+  }
+
+  private resolveTranslatorConfigPath(): string {
+    return path.join(this.resolveGlobalConfigDir(), 'translator.json');
+  }
+
+  private loadPersistedTranslatorConfig(): LocalTranslatorConfig {
+    if (this.sessionMode !== 'persist') {
+      return { ...DEFAULT_LOCAL_TRANSLATOR_CONFIG };
+    }
+    const filePath = this.resolveTranslatorConfigPath();
+    try {
+      if (!fs.existsSync(filePath) || fs.lstatSync(filePath).isSymbolicLink()) {
+        return { ...DEFAULT_LOCAL_TRANSLATOR_CONFIG };
+      }
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+      return normalizeTranslatorConfig(raw, DEFAULT_LOCAL_TRANSLATOR_CONFIG);
+    } catch {
+      return { ...DEFAULT_LOCAL_TRANSLATOR_CONFIG };
+    }
+  }
+
+  private savePersistedTranslatorConfig(cfg: LocalTranslatorConfig): void {
+    if (this.sessionMode !== 'persist') {
+      return;
+    }
+    const filePath = this.resolveTranslatorConfigPath();
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = path.join(dir, `${path.basename(filePath)}.tmp.${process.pid}.${crypto.randomBytes(3).toString('hex')}`);
+    const payload = JSON.stringify(cfg, null, 2) + '\n';
+    fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmpPath, filePath);
+  }
+
+  getEffectiveTranslatorConfig(cwd = this.activeWorkspace): LocalTranslatorConfig {
+    const wsOverride = loadWorkspaceTranslatorOverride(cwd);
+    return mergeTranslatorConfig(this.translatorConfig, wsOverride);
+  }
+
+  getTranslatorConfigState(): TranslatorConfigState {
+    const wsOverride = loadWorkspaceTranslatorOverride(this.activeWorkspace);
+    const effective = mergeTranslatorConfig(this.translatorConfig, wsOverride);
+    return {
+      global: toPublicTranslatorConfig(this.translatorConfig),
+      workspaceOverride: wsOverride,
+      effective: toPublicTranslatorConfig(effective),
+      endpointPresets: LOCAL_ENDPOINT_PRESETS,
+    };
+  }
+
+  async pickOllamaBinary(initialPath?: string): Promise<FolderPickResult> {
+    if (this.isBusy()) {
+      throw new AppError('Cannot pick Ollama executable while a turn is in progress.', 409);
+    }
+    if (this.pickOllamaInFlight) {
+      return this.pickOllamaInFlight;
+    }
+    const effective = this.getEffectiveTranslatorConfig();
+    const pending = this.filePicker({
+      initialPath: initialPath?.trim() || effective.ollamaPath || undefined,
+      title: '选择本机 Ollama 可执行文件（ollama.exe）',
+    }).finally(() => {
+      if (this.pickOllamaInFlight === pending) {
+        this.pickOllamaInFlight = null;
+      }
+    });
+    this.pickOllamaInFlight = pending;
+    return pending;
+  }
+
+  getSmokeConfigState(cwd = this.activeWorkspace): SmokeConfigState {
+    const wsOverride = loadWorkspaceSmokeOverride(cwd);
+    const effective = mergeSmokeConfig(this.smokeConfig, wsOverride);
+    const tools = inspectSmokeTools(effective);
+    return {
+      global: { ...this.smokeConfig },
+      workspaceOverride: wsOverride,
+      effective,
+      tools,
+    };
+  }
+
+  updateSmokeConfig(patch: Partial<SmokeTestConfig>): SmokeConfigState {
+    const next = normalizeSmokeConfig({ ...this.smokeConfig, ...patch }, this.smokeConfig);
+    this.smokeConfig = next;
+    if (this.sessionMode === 'persist') {
+      saveGlobalSmokeConfig(next, this.resolveGlobalConfigDir());
+    }
+    this.invalidateEngineeringStatusCache();
+    const state = this.getSmokeConfigState();
+    this.emitEvent('smoke_config_updated', state);
+    return state;
+  }
+
+  async pickSmokeToolBinary(
+    tool: 'textractor' | 'locale_emulator',
+    initialPath?: string
+  ): Promise<FolderPickResult> {
+    if (this.isBusy()) {
+      throw new AppError('Cannot pick smoke test executable while a turn is in progress.', 409);
+    }
+    if (this.pickSmokeToolInFlight) {
+      return this.pickSmokeToolInFlight;
+    }
+    const effective = this.getSmokeConfigState().effective;
+    const isTr = tool === 'textractor';
+    const pending = this.filePicker({
+      initialPath:
+        initialPath?.trim() || (isTr ? effective.textractorPath : effective.localeEmulatorPath) || undefined,
+      title: isTr ? '选择 TextractorCLI.exe（或所在目录内可执行文件）' : '选择 Locale Emulator（LEProc.exe）',
+      filter: isTr
+        ? 'TextractorCLI (TextractorCLI.exe)|TextractorCLI.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*'
+        : 'Locale Emulator (LEProc.exe)|LEProc.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*',
+    }).finally(() => {
+      if (this.pickSmokeToolInFlight === pending) {
+        this.pickSmokeToolInFlight = null;
+      }
+    });
+    this.pickSmokeToolInFlight = pending;
+    return pending;
+  }
+
+  getLatestSmokeReport(cwd = this.activeWorkspace): SmokeReport | null {
+    return readSmokeReport(cwd);
+  }
+
+  private emitTranslatorSyncStatus(payload: {
+    phase: 'starting' | 'restarting' | 'ready' | 'error';
+    concurrency: number;
+    message: string;
+    status?: OllamaSyncResult['status'];
+    version?: string;
+    managedByPaperCup?: boolean;
+    origin?: string;
+  }): number {
+    const seq = ++this.syncSeq;
+    this.emitEvent('translator_sync_status', {
+      seq,
+      target: 'ollama',
+      ...payload,
+    });
+    return seq;
+  }
+
+  private async runOllamaSyncManaged(input: {
+    baseUrl: string;
+    concurrency: number;
+    ollamaPath?: string;
+    forceRestart: boolean;
+  }): Promise<OllamaSyncResult> {
+    if (!this.ollamaSyncer && this.sessionMode !== 'persist') {
+      return {
+        attempted: false,
+        synced: false,
+        status: 'skipped',
+        concurrency: input.concurrency,
+        reason: 'memory_mode',
+        message: '',
+      };
+    }
+
+    if (!input.forceRestart && this.ollamaEnsureInFlight) {
+      return this.ollamaEnsureInFlight;
+    }
+
+    const execute = async (): Promise<OllamaSyncResult> => {
+      if (input.forceRestart && this.ollamaEnsureInFlight) {
+        await this.ollamaEnsureInFlight.catch(() => undefined);
+      }
+
+      const candidate = isLocalOllamaCandidate(input.baseUrl);
+      let shouldEmitRestart = false;
+      if (input.forceRestart) {
+        let loopback = candidate;
+        if (!loopback) {
+          try {
+            loopback = isLoopbackHostname(new URL(input.baseUrl).hostname);
+          } catch {
+            loopback = false;
+          }
+        }
+        if (candidate) {
+          shouldEmitRestart = true;
+        } else if (loopback) {
+          if (this.ollamaSyncer) {
+            shouldEmitRestart = true;
+          } else {
+            const preCheck = await detectLocalOllamaOrigin(
+              input.baseUrl,
+              this.localTranslatorFetch,
+              input.ollamaPath
+            );
+            if (!preCheck.isOllama) {
+              return {
+                attempted: false,
+                synced: false,
+                status: 'skipped',
+                concurrency: input.concurrency,
+                ...(preCheck.origin ? { origin: preCheck.origin } : {}),
+                reason: preCheck.reason || 'not_ollama',
+                message: '',
+              };
+            }
+            shouldEmitRestart = true;
+          }
+        }
+      }
+
+      let emittedStarting = false;
+      if (shouldEmitRestart) {
+        emittedStarting = true;
+        this.emitTranslatorSyncStatus({
+          phase: 'restarting',
+          concurrency: input.concurrency,
+          message: `正在后台重启本机 Ollama 并切换接管（并发=${input.concurrency}，FA=1 / KV=q8_0 / CTX=2048）…`,
+        });
+      } else if (!input.forceRestart && candidate) {
+        emittedStarting = true;
+        this.emitTranslatorSyncStatus({
+          phase: 'starting',
+          concurrency: input.concurrency,
+          message: `正在后台自动启动本机 Ollama（并发=${input.concurrency}，FA=1 / KV=q8_0 / CTX=2048）…`,
+        });
+      }
+
+      const syncFn = this.ollamaSyncer ?? syncLocalOllamaConcurrency;
+      const syncRes = await syncFn({
+        baseUrl: input.baseUrl,
+        concurrency: input.concurrency,
+        ...(input.ollamaPath !== undefined ? { ollamaPath: input.ollamaPath } : {}),
+        forceRestart: input.forceRestart,
+        fetchImpl: this.localTranslatorFetch,
+      });
+
+      if (syncRes.origin && syncRes.status !== 'skipped') {
+        this.lastOllamaRuntime = {
+          origin: syncRes.origin,
+          running: syncRes.synced,
+          ...(syncRes.version ? { version: syncRes.version } : {}),
+          managedByPaperCup: Boolean(syncRes.managedByPaperCup),
+          concurrency: syncRes.concurrency,
+          checkedAt: Date.now(),
+        };
+        this.invalidateEngineeringStatusCache();
+      }
+
+      let terminalSeq: number | undefined;
+      if (syncRes.attempted) {
+        terminalSeq = this.emitTranslatorSyncStatus({
+          phase: syncRes.synced ? 'ready' : 'error',
+          status: syncRes.status,
+          concurrency: syncRes.concurrency,
+          message: syncRes.message,
+          ...(syncRes.version ? { version: syncRes.version } : {}),
+          ...(syncRes.managedByPaperCup !== undefined ? { managedByPaperCup: syncRes.managedByPaperCup } : {}),
+          ...(syncRes.origin ? { origin: syncRes.origin } : {}),
+        });
+      } else if (emittedStarting && syncRes.status === 'already_running') {
+        terminalSeq = this.emitTranslatorSyncStatus({
+          phase: 'ready',
+          status: 'already_running',
+          concurrency: syncRes.concurrency,
+          message: syncRes.message || '本机 Ollama 已在运行。',
+          ...(syncRes.version ? { version: syncRes.version } : {}),
+          ...(syncRes.managedByPaperCup !== undefined ? { managedByPaperCup: syncRes.managedByPaperCup } : {}),
+          ...(syncRes.origin ? { origin: syncRes.origin } : {}),
+        });
+      } else if (emittedStarting && syncRes.status === 'skipped') {
+        terminalSeq = this.emitTranslatorSyncStatus({
+          phase: 'ready',
+          status: 'skipped',
+          concurrency: syncRes.concurrency,
+          message: '',
+          ...(syncRes.origin ? { origin: syncRes.origin } : {}),
+        });
+      }
+
+      return terminalSeq !== undefined ? { ...syncRes, syncSeq: terminalSeq } : syncRes;
+    };
+
+    if (!input.forceRestart) {
+      const pending = execute().finally(() => {
+        if (this.ollamaEnsureInFlight === pending) {
+          this.ollamaEnsureInFlight = null;
+        }
+      });
+      this.ollamaEnsureInFlight = pending;
+      return pending;
+    }
+
+    return execute();
+  }
+
+  async getLocalOllamaStatus(options?: {
+    baseUrl?: string;
+    ollamaPath?: string;
+  }): Promise<OllamaStatusResult> {
+    const effective = this.getEffectiveTranslatorConfig();
+    const baseUrl = options?.baseUrl?.trim() || effective.baseUrl;
+    const ollamaPath = options?.ollamaPath !== undefined ? options.ollamaPath : effective.ollamaPath;
+    const status = await getLocalOllamaStatus({
+      baseUrl,
+      ollamaPath,
+      fetchImpl: this.localTranslatorFetch,
+    });
+    if (status.origin) {
+      this.lastOllamaRuntime = {
+        origin: status.origin,
+        running: status.running,
+        ...(status.version ? { version: status.version } : {}),
+        managedByPaperCup: status.managedByPaperCup,
+        ...(status.lastSyncedConcurrency !== undefined ? { concurrency: status.lastSyncedConcurrency } : {}),
+        checkedAt: Date.now(),
+      };
+    }
+    return status;
+  }
+
+  async startLocalOllama(options?: {
+    baseUrl?: string;
+    ollamaPath?: string;
+    concurrency?: number;
+    forceRestart?: boolean;
+  }): Promise<{
+    ok: boolean;
+    ollamaSync: OllamaSyncResult;
+    status: OllamaStatusResult;
+    models: LocalProbeModel[];
+    suggestedModel: string | null;
+  }> {
+    if (this.isBusy()) {
+      throw new AppError('Cannot start or restart Ollama while a turn is in progress.', 409);
+    }
+    const effective = this.getEffectiveTranslatorConfig();
+    const baseUrl = options?.baseUrl?.trim() || effective.baseUrl;
+    const ollamaPath = options?.ollamaPath !== undefined ? options.ollamaPath : effective.ollamaPath;
+    const concurrency =
+      typeof options?.concurrency === 'number' && Number.isFinite(options.concurrency)
+        ? Math.max(1, Math.min(8, Math.round(options.concurrency)))
+        : effective.concurrency;
+
+    const ollamaSync = await this.runOllamaSyncManaged({
+      baseUrl,
+      concurrency,
+      ollamaPath,
+      forceRestart: Boolean(options?.forceRestart),
+    });
+
+    const status = await this.getLocalOllamaStatus({ baseUrl, ollamaPath });
+    let models: LocalProbeModel[] = status.models;
+    if (models.length === 0 && (ollamaSync.synced || status.running)) {
+      try {
+        const probed = await probeLocalTranslatorEndpoint(baseUrl, {
+          apiKey: effective.apiKey,
+          fetchImpl: this.localTranslatorFetch,
+        });
+        if (probed.models.length > 0) {
+          models = probed.models;
+        }
+      } catch {
+        // Ignore if /v1/models fails while tags already succeeded or empty
+      }
+    }
+    const suggestedModel = pickPreferredLocalModel(models) ?? status.suggestedModel;
+    return {
+      ok: ollamaSync.synced || status.running,
+      ollamaSync,
+      status: {
+        ...status,
+        models,
+        suggestedModel,
+      },
+      models,
+      suggestedModel,
+    };
+  }
+
+  async updateTranslatorConfig(patch: TranslatorConfigUpdateInput): Promise<TranslatorConfigUpdateResult> {
+    if (this.isBusy()) {
+      throw new AppError('Cannot update translator configuration while a turn is in progress.', 409);
+    }
+    const nextPatch: Record<string, unknown> = { ...patch };
+    if (patch.clearApiKey === true) {
+      nextPatch.apiKey = '';
+    } else if (patch.apiKey === undefined) {
+      delete nextPatch.apiKey;
+    }
+    delete nextPatch.clearApiKey;
+
+    const next = normalizeTranslatorConfig(nextPatch, this.translatorConfig);
+    if (next.mode === 'local_mt' && !next.baseUrl) {
+      throw new Error('本地翻译模式需要填写本地模型端点 URL（如 http://127.0.0.1:11434/v1）。');
+    }
+
+    this.translatorConfig = next;
+    this.savePersistedTranslatorConfig(next);
+    this.invalidateEngineeringStatusCache();
+    const state = this.getTranslatorConfigState();
+
+    let ollamaSync: OllamaSyncResult;
+    if (state.effective.mode === 'local_mt' && (this.ollamaSyncer || this.sessionMode === 'persist')) {
+      ollamaSync = await this.runOllamaSyncManaged({
+        baseUrl: state.effective.baseUrl,
+        concurrency: state.effective.concurrency,
+        ollamaPath: state.effective.ollamaPath,
+        forceRestart: true,
+      });
+    } else {
+      ollamaSync = {
+        attempted: false,
+        synced: false,
+        status: 'skipped',
+        concurrency: state.effective.concurrency,
+        reason: state.effective.mode !== 'local_mt' ? 'cloud_mode' : 'memory_mode',
+        message: '',
+      };
+    }
+
+    this.emitEvent('translator_config_updated', state);
+    this.emitEvent('token_usage', this.getSessionTokenUsage());
+    return {
+      ...state,
+      ollamaSync,
+    };
+  }
+
+  async probeLocalTranslator(
+    baseUrl: string,
+    apiKey?: string,
+    options?: { ollamaPath?: string; autoStartOllama?: boolean; concurrency?: number }
+  ): Promise<TranslatorProbeResult> {
+    const effective = this.getEffectiveTranslatorConfig();
+    const effectiveKey =
+      typeof apiKey === 'string'
+        ? apiKey.trim() || this.translatorConfig.apiKey
+        : this.translatorConfig.apiKey;
+    try {
+      const probeRes = await probeLocalTranslatorEndpoint(baseUrl, {
+        apiKey: effectiveKey,
+        fetchImpl: this.localTranslatorFetch,
+      });
+      return {
+        ...probeRes,
+        suggestedModel: pickPreferredLocalModel(probeRes.models),
+        ollamaAutoStarted: false,
+        ...(this.lastOllamaRuntime?.origin &&
+        (() => {
+          try {
+            return new URL(baseUrl).origin === this.lastOllamaRuntime?.origin;
+          } catch {
+            return false;
+          }
+        })()
+          ? {
+              ...(this.lastOllamaRuntime.version ? { ollamaVersion: this.lastOllamaRuntime.version } : {}),
+              ollamaManaged: this.lastOllamaRuntime.managedByPaperCup,
+            }
+          : {}),
+      };
+    } catch (err) {
+      if (
+        err instanceof LocalTranslatorEndpointError &&
+        options?.autoStartOllama !== false &&
+        isLocalOllamaCandidate(baseUrl) &&
+        (this.ollamaSyncer || this.sessionMode === 'persist')
+      ) {
+        const concurrency =
+          typeof options?.concurrency === 'number' && Number.isFinite(options.concurrency)
+            ? Math.max(1, Math.min(8, Math.round(options.concurrency)))
+            : effective.concurrency;
+        const syncRes = await this.runOllamaSyncManaged({
+          baseUrl,
+          concurrency,
+          ollamaPath: options?.ollamaPath !== undefined ? options.ollamaPath : effective.ollamaPath,
+          forceRestart: false,
+        });
+        if (!syncRes.synced) {
+          throw new LocalTranslatorEndpointError(syncRes.message || '自动启动本机 Ollama 失败。');
+        }
+        const retryRes = await probeLocalTranslatorEndpoint(baseUrl, {
+          apiKey: effectiveKey,
+          fetchImpl: this.localTranslatorFetch,
+        });
+        return {
+          ...retryRes,
+          suggestedModel: pickPreferredLocalModel(retryRes.models),
+          ollamaAutoStarted: syncRes.status === 'started',
+          ...(syncRes.version ? { ollamaVersion: syncRes.version } : {}),
+          ollamaManaged: Boolean(syncRes.managedByPaperCup),
+          ...(syncRes.syncSeq !== undefined ? { ollamaSyncSeq: syncRes.syncSeq } : {}),
+        };
+      }
+      throw err;
+    }
+  }
+
   private installSessionRedaction(manager: SessionManager): void {
     if (this.wrappedSessionManagers.has(manager)) {
       return;
@@ -714,22 +1719,137 @@ export class AgentService extends EventEmitter {
     this.wrappedSessionManagers.add(manager);
     const origAppend = manager.appendMessage.bind(manager);
     manager.appendMessage = ((message: any) => {
-      const sanitized = redactUnknownValue(message, this.runtimeApiKeys.values());
-      return origAppend(sanitized);
+      const sanitized = redactUnknownValue(message, this.getAllKnownSecrets());
+      const entryId = origAppend(sanitized);
+      if (
+        this.sessionManager === manager &&
+        (sanitized?.role === 'assistant' || (sanitized?.role === 'toolResult' && sanitized?.usage))
+      ) {
+        this.emitEvent('token_usage', this.getSessionTokenUsage());
+      }
+      return entryId;
     }) as typeof manager.appendMessage;
   }
 
+  private rememberDeliveredUserMode(
+    sessionId: string | null,
+    timestamp: unknown,
+    text: string,
+    mode: QueuedMessageMode,
+    options?: { persist?: boolean }
+  ): void {
+    if (!sessionId || !text.trim()) return;
+    const tsPart = typeof timestamp === 'number' && Number.isFinite(timestamp) ? String(timestamp) : '0';
+    const key = `${sessionId}:${tsPart}:${text}`;
+    const alreadyRecorded = this.deliveredUserModes.get(key) === mode;
+    this.deliveredUserModes.set(key, mode);
+    if (this.deliveredUserModes.size > 400) {
+      const firstKey = this.deliveredUserModes.keys().next().value;
+      if (firstKey !== undefined) {
+        this.deliveredUserModes.delete(firstKey);
+      }
+    }
+    if (
+      options?.persist !== false &&
+      !alreadyRecorded &&
+      this.sessionManager &&
+      this.sessionManager.getSessionId?.() === sessionId
+    ) {
+      try {
+        const safeText = redactSecrets(text, this.getAllKnownSecrets());
+        this.sessionManager.appendCustomEntry?.(DELIVERY_MODE_CUSTOM_TYPE, {
+          timestamp: tsPart,
+          text: safeText,
+          mode,
+        });
+      } catch {
+        // Non-fatal: in-memory lookup still works if custom entry persistence fails
+      }
+    }
+  }
+
+  private collectPersistedDeliveryModes(
+    sessionEntries?: readonly any[]
+  ): Map<string, QueuedMessageMode> {
+    const out = new Map<string, QueuedMessageMode>();
+    if (!Array.isArray(sessionEntries)) return out;
+    for (const entry of sessionEntries) {
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        entry.type !== 'custom' ||
+        entry.customType !== DELIVERY_MODE_CUSTOM_TYPE
+      ) {
+        continue;
+      }
+      const data = entry.data as { timestamp?: unknown; text?: unknown; mode?: unknown } | undefined;
+      if (!data || (data.mode !== 'steer' && data.mode !== 'followUp')) continue;
+      const text = typeof data.text === 'string' ? data.text : '';
+      if (!text.trim()) continue;
+      const tsPart =
+        typeof data.timestamp === 'number' && Number.isFinite(data.timestamp)
+          ? String(data.timestamp)
+          : typeof data.timestamp === 'string' && data.timestamp.trim()
+            ? data.timestamp.trim()
+            : '0';
+      out.set(`${tsPart}:${text}`, data.mode);
+    }
+    return out;
+  }
+
+  private lookupDeliveredUserMode(
+    sessionId: string | null | undefined,
+    timestamp: unknown,
+    text: string,
+    persistedModes?: ReadonlyMap<string, QueuedMessageMode>
+  ): QueuedMessageMode | undefined {
+    if (!text.trim()) return undefined;
+    const tsPart = typeof timestamp === 'number' && Number.isFinite(timestamp) ? String(timestamp) : '0';
+    if (sessionId) {
+      const mem = this.deliveredUserModes.get(`${sessionId}:${tsPart}:${text}`);
+      if (mem) return mem;
+    }
+    if (persistedModes) {
+      return persistedModes.get(`${tsPart}:${text}`) ?? persistedModes.get(`0:${text}`);
+    }
+    return undefined;
+  }
+
   private projectMessages(
-    rawMessages: readonly any[],
-    options?: { markUnresolvedToolsInterrupted?: boolean }
+    branchOrMessages: readonly any[],
+    options?: {
+      markUnresolvedToolsInterrupted?: boolean;
+      sessionId?: string | null;
+      sessionEntries?: readonly any[];
+      fromBranchEntries?: boolean;
+    }
   ): PersistedChatMessage[] {
     const markInterrupted = options?.markUnresolvedToolsInterrupted ?? true;
+    const sessionId = options?.sessionId ?? null;
+    const fromBranch = options?.fromBranchEntries === true;
+    const persistedModes = this.collectPersistedDeliveryModes(
+      options?.sessionEntries ?? (fromBranch ? branchOrMessages : undefined)
+    );
+    const omittedEntryIds = new Set<string>();
+    if (fromBranch) {
+      const latestEditByTarget = new Map<string, any>();
+      for (const entry of branchOrMessages) {
+        if (entry && typeof entry === 'object' && entry.type === 'context_edit' && typeof entry.targetId === 'string') {
+          latestEditByTarget.set(entry.targetId, entry);
+        }
+      }
+      for (const [targetId, editEntry] of latestEditByTarget) {
+        if (editEntry.replacement === null) {
+          omittedEntryIds.add(targetId);
+        }
+      }
+    }
     const projected: PersistedChatMessage[] = [];
     let activeAssistant: PersistedChatMessage | null = null;
     const toolByCallId = new Map<string, PersistedToolCall>();
     let seq = 0;
 
-    const flushAssistant = () => {
+    const flushAssistant = (isFinalSegment: boolean) => {
       if (!activeAssistant) return;
       if (!activeAssistant.content && !activeAssistant.thinking && !(activeAssistant.tools && activeAssistant.tools.length)) {
         activeAssistant = null;
@@ -754,7 +1874,7 @@ export class AgentService extends EventEmitter {
         if (hadInterruptedTool) {
           activeAssistant.error = true;
           activeAssistant.content = '任务已中断（服务重启或未收到工具返回）。';
-        } else {
+        } else if (isFinalSegment) {
           activeAssistant.content = '已完成任务。';
         }
       }
@@ -763,17 +1883,45 @@ export class AgentService extends EventEmitter {
       toolByCallId.clear();
     };
 
-    for (const msg of rawMessages) {
+    for (const item of branchOrMessages) {
+      if (!item || typeof item !== 'object') continue;
+      if (fromBranch) {
+        if (item.type === 'compaction') {
+          flushAssistant(false);
+          const info = extractCompactionSummaryInfo(item);
+          projected.push({
+            id: info.id,
+            role: 'compaction',
+            content: info.summary,
+            timestamp: this.formatTimestamp(info.timestamp) || info.timestamp,
+            compaction: {
+              reason: info.reason,
+              tokensBefore: info.tokensBefore,
+              tokensAfter: info.tokensAfter,
+              ...(info.focus ? { focus: info.focus } : {}),
+              ...(info.checkpointPath ? { checkpointPath: info.checkpointPath } : {}),
+            },
+          });
+          continue;
+        }
+        if (item.type !== 'message') continue;
+        if (typeof item.id === 'string' && omittedEntryIds.has(item.id)) continue;
+      }
+      const msg = fromBranch ? item.message : item;
       if (!msg || typeof msg !== 'object') continue;
       if (msg.role === 'user') {
-        flushAssistant();
+        flushAssistant(false);
         const text = this.extractText(msg.content);
-        if (!text.trim()) continue;
+        const images = extractImagesFromContent(msg.content);
+        if (!text.trim() && images.length === 0) continue;
+        const deliveryMode = this.lookupDeliveredUserMode(sessionId, msg.timestamp, text, persistedModes);
         projected.push({
           id: `hist-${++seq}`,
           role: 'user',
           content: text,
+          ...(images.length > 0 ? { images } : {}),
           timestamp: this.formatTimestamp(msg.timestamp),
+          ...(deliveryMode ? { deliveryMode } : {}),
         });
       } else if (msg.role === 'assistant') {
         if (!activeAssistant) {
@@ -858,7 +2006,7 @@ export class AgentService extends EventEmitter {
         }
       }
     }
-    flushAssistant();
+    flushAssistant(true);
     return projected;
   }
 
@@ -876,7 +2024,12 @@ export class AgentService extends EventEmitter {
       typeof header?.timestamp === 'string' && header.timestamp
         ? header.timestamp
         : new Date().toISOString();
-    const rawMsgs = manager.buildSessionContext?.().messages ?? [];
+    const branchEntries = manager.getBranch?.();
+    const rawMsgs = Array.isArray(branchEntries)
+      ? branchEntries
+          .filter((e: any) => e && e.type === 'message' && e.message)
+          .map((e: any) => e.message)
+      : (manager.buildSessionContext?.().messages ?? []);
     let firstUserText = '';
     let messageCount = 0;
     let lastTs = Date.parse(createdAt) || Date.now();
@@ -888,7 +2041,7 @@ export class AgentService extends EventEmitter {
           lastTs = Math.max(lastTs, msg.timestamp);
         }
         if (!firstUserText && msg.role === 'user') {
-          firstUserText = this.extractText(msg.content);
+          firstUserText = summarizeUserMessagePreview(msg.content, this.extractText(msg.content));
         }
       }
     }
@@ -965,9 +2118,11 @@ export class AgentService extends EventEmitter {
           continue;
         }
         if (entry.type !== 'message') continue;
-        messageCount++;
         const msg = entry.message;
         if (!msg || typeof msg !== 'object') continue;
+        if (msg.role === 'user' || msg.role === 'assistant') {
+          messageCount++;
+        }
         const msgTs =
           typeof msg.timestamp === 'number' && Number.isFinite(msg.timestamp)
             ? msg.timestamp
@@ -978,9 +2133,9 @@ export class AgentService extends EventEmitter {
           lastActivityTime = Math.max(lastActivityTime ?? 0, msgTs);
         }
         if ((msg.role === 'user' || msg.role === 'assistant') && !firstMessage && msg.role === 'user') {
-          const text = this.extractText(msg.content);
-          if (text) {
-            firstMessage = text;
+          const preview = summarizeUserMessagePreview(msg.content, this.extractText(msg.content));
+          if (preview) {
+            firstMessage = preview;
           }
         }
       }
@@ -1017,12 +2172,79 @@ export class AgentService extends EventEmitter {
     return meta;
   }
 
+  private sessionManagerHasMessages(manager: SessionManager | null | undefined): boolean {
+    const branchEntries = manager?.getBranch?.();
+    const rawMsgs = Array.isArray(branchEntries)
+      ? branchEntries
+          .filter((e: any) => e && e.type === 'message' && e.message)
+          .map((e: any) => e.message)
+      : (manager?.buildSessionContext?.().messages ?? []);
+    return rawMsgs.some(
+      (msg: any) => msg && typeof msg === 'object' && (msg.role === 'user' || msg.role === 'assistant')
+    );
+  }
+
+  private commitMemorySessionRecord(): void {
+    if (this.sessionMode !== 'memory' || !this.sessionManager) return;
+    const id = this.sessionManager.getSessionId();
+    const map = this.getWorkspaceMemoryMap();
+    const existing = map.get(id);
+    if (existing) {
+      existing.updatedAtMs = Date.now();
+      existing.seq = ++this.memorySeq;
+      return;
+    }
+    map.set(id, {
+      manager: this.sessionManager,
+      updatedAtMs: Date.now(),
+      seq: ++this.memorySeq,
+    });
+  }
+
+  private async findLatestArchivedSessionFile(
+    workspacePath: string,
+    sessionDir: string
+  ): Promise<string | null> {
+    if (!fs.existsSync(sessionDir)) return null;
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(sessionDir).filter((file) => file.endsWith('.jsonl'));
+    } catch {
+      return null;
+    }
+    const candidates: Array<{ filePath: string; stats: fs.Stats }> = [];
+    for (const file of files) {
+      const filePath = path.join(sessionDir, file);
+      try {
+        const stats = fs.statSync(filePath);
+        if (stats.isFile()) {
+          candidates.push({ filePath, stats });
+        }
+      } catch {
+        // Ignore stat error on transient files
+      }
+    }
+    candidates.sort((a, b) => b.stats.mtimeMs - a.stats.mtimeMs);
+    for (const candidate of candidates) {
+      const meta = await this.readSessionFileMetaCached(
+        candidate.filePath,
+        workspacePath,
+        candidate.stats
+      );
+      if (meta && meta.cwdMatches && meta.summary.messageCount > 0) {
+        return candidate.filePath;
+      }
+    }
+    return null;
+  }
+
   async listSessionsForWorkspace(workspacePath: string): Promise<SessionSummary[]> {
     if (this.sessionMode === 'memory') {
       const map = this.getWorkspaceMemoryMap(workspacePath);
       return Array.from(map.values())
         .sort((a, b) => b.updatedAtMs - a.updatedAtMs || b.seq - a.seq)
-        .map((rec) => this.summarizeSessionManager(rec.manager, rec.updatedAtMs));
+        .map((rec) => this.summarizeSessionManager(rec.manager, rec.updatedAtMs))
+        .filter((s) => s.messageCount > 0);
     }
 
     const sessionDir = this.resolveSessionDir(workspacePath);
@@ -1053,7 +2275,7 @@ export class AgentService extends EventEmitter {
         return;
       }
       const meta = await this.readSessionFileMetaCached(filePath, workspacePath, stats);
-      if (meta && meta.cwdMatches) {
+      if (meta && meta.cwdMatches && meta.summary.messageCount > 0) {
         metas.push(meta);
       }
     });
@@ -1073,7 +2295,10 @@ export class AgentService extends EventEmitter {
     const summaries = await this.listSessionsForWorkspace(this.activeWorkspace);
     const activeId = this.sessionManager?.getSessionId?.();
     if (activeId && this.sessionManager && !summaries.some((s) => s.id === activeId)) {
-      summaries.unshift(this.summarizeSessionManager(this.sessionManager));
+      const activeSummary = this.summarizeSessionManager(this.sessionManager);
+      if (activeSummary.messageCount > 0) {
+        summaries.unshift(activeSummary);
+      }
     }
     return summaries;
   }
@@ -1090,6 +2315,13 @@ export class AgentService extends EventEmitter {
     return this.subagentManager.getTask(this.activeWorkspace, taskId);
   }
 
+  getMainQueueState(): PendingQueueState {
+    if (!this.isRunningTurn) {
+      return { steering: [], followUp: [] };
+    }
+    return this.mainQueueController.getState();
+  }
+
   getTurnSyncState(): TurnSyncState {
     const sessionId = this.sessionManager?.getSessionId?.() ?? null;
     const activeTurn =
@@ -1101,32 +2333,222 @@ export class AgentService extends EventEmitter {
         : null;
     return {
       isRunning: this.isRunningTurn,
+      isCompacting: this.isCompacting,
+      queuedCompaction: this.queuedMainCompaction ? { ...this.queuedMainCompaction } : null,
       sessionId,
       activeTurn,
+      pendingQueue: this.getMainQueueState(),
+      activeDirectSubagentTaskId: this.activeDirectSubagentTaskId,
       subagentTasks: this.listSubagentTasks(sessionId, SUBAGENT_TASKS_HISTORY_LIMIT),
+      tokenUsage: this.getSessionTokenUsage(),
+      chatForms: listChatForms(this.activeWorkspace),
     };
+  }
+
+  getSessionTokenUsage(): SessionTokenUsageSnapshot {
+    const sessionId = this.sessionManager?.getSessionId?.() ?? null;
+    const entries: any[] = this.sessionManager?.getEntries?.() ?? [];
+
+    const total = createEmptyTokenBucket();
+    const cloud = createEmptyTokenBucket();
+    const local = createEmptyTokenBucket();
+    const breakdown = {
+      main: createEmptyTokenBucket(),
+      cloudTranslator: createEmptyTokenBucket(),
+      cloudEscalation: createEmptyTokenBucket(),
+      roleChecker: createEmptyTokenBucket(),
+      reverser: createEmptyTokenBucket(),
+      smokeVision: createEmptyTokenBucket(),
+      otherSubagents: createEmptyTokenBucket(),
+      compaction: createEmptyTokenBucket(),
+      localMt: createEmptyTokenBucket(),
+    };
+    const currentCloud = createEmptyTokenBucket();
+    const currentLocal = createEmptyTokenBucket();
+    let cloudCostUsd = 0;
+
+    const recordCloud = (targetBucket: TokenUsageBucket, rawUsage: any, isCurrentTurn: boolean) => {
+      addUsageToBucket(targetBucket, rawUsage);
+      addUsageToBucket(cloud, rawUsage);
+      addUsageToBucket(total, rawUsage);
+      if (isCurrentTurn) {
+        addUsageToBucket(currentCloud, rawUsage);
+      }
+      cloudCostUsd += toSafeNonNegNumber(rawUsage?.cost?.total);
+    };
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      if (!entry || typeof entry !== 'object') continue;
+      const isCurrentTurn = i >= this.turnUsageStartEntryIndex;
+
+      if (entry.type === 'message' && entry.message?.role === 'assistant' && entry.message.usage) {
+        recordCloud(breakdown.main, entry.message.usage, isCurrentTurn);
+      } else if (entry.type === 'message' && entry.message?.role === 'toolResult' && entry.message.usage) {
+        recordCloud(breakdown.otherSubagents, entry.message.usage, isCurrentTurn);
+      } else if ((entry.type === 'compaction' || entry.type === 'branch_summary') && entry.usage) {
+        recordCloud(breakdown.compaction, entry.usage, isCurrentTurn);
+      } else if (entry.type === 'usage' && entry.usage) {
+        const kind = String(entry.kind || '');
+        const isEstimated = entry.note === 'estimated';
+        if (kind.startsWith('local_mt:')) {
+          addUsageToBucket(breakdown.localMt, entry.usage, { estimated: isEstimated });
+          addUsageToBucket(local, entry.usage, { estimated: isEstimated });
+          addUsageToBucket(total, entry.usage, { estimated: isEstimated });
+          if (isCurrentTurn) {
+            addUsageToBucket(currentLocal, entry.usage, { estimated: isEstimated });
+          }
+        } else {
+          const target =
+            kind === 'subagent:translator'
+              ? breakdown.cloudTranslator
+              : kind === 'subagent:cloud_escalation'
+                ? breakdown.cloudEscalation
+                : kind === 'subagent:role-checker'
+                  ? breakdown.roleChecker
+                  : kind === 'subagent:reverser'
+                    ? breakdown.reverser
+                    : kind === 'cloud:smoke-vision'
+                      ? breakdown.smokeVision
+                      : kind === 'compaction'
+                        ? breakdown.compaction
+                        : breakdown.otherSubagents;
+          recordCloud(target, entry.usage, isCurrentTurn);
+        }
+      }
+    }
+
+    let live = false;
+    if (this.isRunningTurn && this.inFlightMainStreamText.length > 0) {
+      const activeKey =
+        this.activeTurnSnapshot?.model ||
+        (this.currentSession?.model
+          ? `${this.currentSession.model.provider}/${this.currentSession.model.id}`
+          : '');
+      const estOut = estimateTextTokens(this.inFlightMainStreamText, detectModelFamily(activeKey));
+      if (estOut > 0) {
+        const deltaUsage = { input: 0, output: estOut, cacheRead: 0, cacheWrite: 0, totalTokens: estOut };
+        const opts = { estimated: true, countCall: false };
+        addUsageToBucket(breakdown.main, deltaUsage, opts);
+        addUsageToBucket(cloud, deltaUsage, opts);
+        addUsageToBucket(total, deltaUsage, opts);
+        addUsageToBucket(currentCloud, deltaUsage, opts);
+        live = true;
+      }
+    }
+
+    let contextUsage: SessionTokenUsageSnapshot['contextUsage'] = null;
+    try {
+      const rawCtx = this.currentSession?.getContextUsage?.();
+      if (rawCtx && typeof rawCtx.contextWindow === 'number' && rawCtx.contextWindow > 0) {
+        const compactionCfg = readPaperCupCompactionConfig();
+        let tokens: number | null = typeof rawCtx.tokens === 'number' ? rawCtx.tokens : null;
+        let percent: number | null = typeof rawCtx.percent === 'number' ? rawCtx.percent : null;
+        if (tokens !== null && this.sessionManager) {
+          const branch = this.sessionManager.getBranch();
+          if (hasPostUsageContextEdit(branch)) {
+            const realTokens = estimateRealProjectedContextTokens(
+              this.sessionManager.buildSessionProjection(),
+              branch
+            );
+            tokens = realTokens;
+            percent = (realTokens / rawCtx.contextWindow) * 100;
+          }
+        }
+        contextUsage = {
+          tokens,
+          contextWindow: rawCtx.contextWindow,
+          percent,
+          ...(compactionCfg.enabled
+            ? {
+                triggerTokens: computeCompactionThresholds(rawCtx.contextWindow, 'main', compactionCfg)
+                  .triggerTokens,
+              }
+            : {}),
+        };
+      }
+    } catch {
+      // Ignore context probe errors while switching session/model
+    }
+
+    return {
+      sessionId,
+      total,
+      cloud,
+      local,
+      breakdown,
+      currentTurn: {
+        cloud: currentCloud,
+        local: currentLocal,
+        totalTokens: currentCloud.totalTokens + currentLocal.totalTokens,
+        live,
+      },
+      contextUsage,
+      translatorMode: this.getEffectiveTranslatorConfig().mode,
+      cloudCostUsd: Math.round(cloudCostUsd * 1e8) / 1e8,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  private recordSessionUsage(
+    kind: string,
+    provider: string,
+    model: string,
+    usage: Usage,
+    options?: { sessionId?: string | null; note?: string }
+  ): void {
+    if (!this.sessionManager) return;
+    if (options?.sessionId && this.sessionManager.getSessionId() !== options.sessionId) {
+      return;
+    }
+    const safeNote = options?.note ? redactSecrets(options.note, this.getAllKnownSecrets()) : undefined;
+    this.sessionManager.appendUsage(kind, provider, model, usage, safeNote);
+    this.emitEvent('token_usage', this.getSessionTokenUsage());
   }
 
   async getSessionHistory(): Promise<SessionHistoryState> {
     await this.initSession();
     const sessionId = this.sessionManager?.getSessionId?.() ?? null;
-    const raw = this.sessionManager?.buildSessionContext?.().messages ?? [];
-    const projected = this.projectMessages(raw, {
-      markUnresolvedToolsInterrupted: true,
-    });
+    const branchEntries = this.sessionManager?.getBranch?.();
+    const sessionEntries = this.sessionManager?.getEntries?.() ?? [];
+    const projected = Array.isArray(branchEntries)
+      ? this.projectMessages(branchEntries, {
+          markUnresolvedToolsInterrupted: true,
+          sessionId,
+          sessionEntries,
+          fromBranchEntries: true,
+        })
+      : this.projectMessages(this.sessionManager?.buildSessionContext?.().messages ?? [], {
+          markUnresolvedToolsInterrupted: true,
+          sessionId,
+          sessionEntries,
+        });
     const isActiveRunning = Boolean(
       this.isRunningTurn && this.activeTurnSnapshot && this.activeTurnSnapshot.sessionId === sessionId
     );
+    const activeCommitted =
+      this.activeTurnCommittedMessages.length > 0
+        ? this.activeTurnCommittedMessages.map((m) => ({
+            ...m,
+            ...(Array.isArray(m.images) && m.images.length > 0
+              ? { images: m.images.map((img) => ({ ...img })) }
+              : {}),
+            ...(Array.isArray(m.tools) ? { tools: m.tools.map((t) => ({ ...t })) } : {}),
+            ...(m.compaction ? { compaction: { ...m.compaction } } : {}),
+          }))
+        : [
+            {
+              id: 'active-user',
+              role: 'user' as const,
+              content: this.activeTurnPrompt,
+              ...(this.activeTurnImages.length > 0
+                ? { images: this.activeTurnImages.map((img) => ({ ...img })) }
+                : {}),
+              timestamp: this.activeTurnStartedAtLabel,
+            },
+          ];
     const messages = isActiveRunning
-      ? [
-          ...projected.slice(0, this.turnBaseMessageCount),
-          {
-            id: 'active-user',
-            role: 'user' as const,
-            content: this.activeTurnPrompt,
-            timestamp: this.activeTurnStartedAtLabel,
-          },
-        ]
+      ? [...projected.slice(0, this.turnBaseMessageCount), ...activeCommitted]
       : projected;
     return {
       sessionId,
@@ -1135,42 +2557,98 @@ export class AgentService extends EventEmitter {
       messages,
       sessions: await this.listWorkspaceSessions(),
       isRunning: this.isRunningTurn,
+      isCompacting: this.isCompacting,
+      queuedCompaction: this.queuedMainCompaction ? { ...this.queuedMainCompaction } : null,
       activeTurn: isActiveRunning
         ? {
             ...this.activeTurnSnapshot!,
             tools: this.activeTurnSnapshot!.tools.map((t) => ({ ...t })),
           }
         : null,
+      pendingQueue: isActiveRunning ? this.getMainQueueState() : { steering: [], followUp: [] },
+      activeDirectSubagentTaskId: this.activeDirectSubagentTaskId,
       subagentTasks: this.listSubagentTasks(sessionId, SUBAGENT_TASKS_HISTORY_LIMIT),
+      tokenUsage: this.getSessionTokenUsage(),
+      chatForms: listChatForms(this.activeWorkspace),
     };
   }
 
+  getChatFormsState(): { forms: ChatFormRecord[]; roster: CharacterRosterStore | null } {
+    return {
+      forms: listChatForms(this.activeWorkspace),
+      roster: readCharacterRoster(this.activeWorkspace),
+    };
+  }
+
+  async submitCharacterForm(
+    formId: string,
+    payload: {
+      items: CharacterConfirmationSubmissionItem[];
+      dismissedNames?: string[];
+      autoContinue?: boolean;
+      model?: string;
+    }
+  ): Promise<{
+    form: ChatFormRecord;
+    roster: CharacterRosterStore;
+    editedCount: number;
+    glossaryEntriesAdded: number;
+    startedTurn: boolean;
+    userPrompt?: string;
+  }> {
+    const autoContinue = payload.autoContinue !== false;
+    if (autoContinue && this.isBusy()) {
+      throw new AppError('当前正在执行对话任务，无法在提交表单后立即唤醒 Agent。请等待当前任务完成或选择「仅保存译名」。', 409, 'CONFLICT');
+    }
+
+    const res = submitCharacterConfirmationForm(this.activeWorkspace, formId, {
+      items: payload.items,
+      dismissedNames: payload.dismissedNames,
+    });
+
+    this.invalidateEngineeringStatusCache();
+    this.emitEvent('chat_form_updated', res.form);
+    this.emitEvent('batch_progress', {
+      type: 'plan',
+      summary: `已锁定 ${res.roster.characters.length} 位角色译名`,
+      timestamp: new Date().toISOString(),
+    });
+
+    let startedTurn = false;
+    let userPrompt: string | undefined;
+    if (autoContinue) {
+      userPrompt = buildCharacterFormConfirmationMessage(res.form, res.editedItems);
+      await this.startTurn(userPrompt, { model: payload.model });
+      startedTurn = true;
+    }
+
+    return {
+      form: res.form,
+      roster: res.roster,
+      editedCount: res.editedItems.length,
+      glossaryEntriesAdded: res.glossaryEntriesAdded,
+      startedTurn,
+      ...(userPrompt ? { userPrompt } : {}),
+    };
+  }
+
+  cancelWorkspaceChatForm(formId: string): ChatFormRecord {
+    const updated = cancelChatForm(this.activeWorkspace, formId);
+    this.invalidateEngineeringStatusCache();
+    this.emitEvent('chat_form_updated', updated);
+    return updated;
+  }
+
   async createNewSession(): Promise<SessionHistoryState> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot start a new session while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot start a new session while a turn is in progress.', 409);
     }
     this.disposeCurrentSessionState(true);
     if (this.sessionMode === 'memory') {
-      const fresh = SessionManager.inMemory(this.activeWorkspace);
-      this.getWorkspaceMemoryMap().set(fresh.getSessionId(), {
-        manager: fresh,
-        updatedAtMs: Date.now(),
-        seq: ++this.memorySeq,
-      });
-      this.sessionManager = fresh;
+      this.sessionManager = SessionManager.inMemory(this.activeWorkspace);
     } else {
       const sessionDir = this.resolveSessionDir(this.activeWorkspace);
-      const fresh = SessionManager.create(this.activeWorkspace, sessionDir);
-      const sessionFile = fresh.getSessionFile();
-      const header = fresh.getHeader();
-      if (sessionFile && header) {
-        fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-        fs.writeFileSync(sessionFile, `${JSON.stringify(header)}\n`, 'utf-8');
-        this.bumpSessionFileMtime(sessionFile, sessionDir);
-        this.sessionManager = SessionManager.open(sessionFile, sessionDir, this.activeWorkspace);
-      } else {
-        this.sessionManager = fresh;
-      }
+      this.sessionManager = SessionManager.create(this.activeWorkspace, sessionDir);
     }
     await this.initSession();
     const state = await this.getSessionHistory();
@@ -1184,12 +2662,12 @@ export class AgentService extends EventEmitter {
   }
 
   async selectSession(sessionId: string): Promise<SessionHistoryState> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot switch session while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot switch session while a turn is in progress.', 409);
     }
     const targetId = sessionId.trim();
     if (!targetId) {
-      throw new Error('Session identifier cannot be empty.');
+      throw new AppError('Session identifier cannot be empty.', 400);
     }
     if (this.sessionManager?.getSessionId?.() === targetId && this.currentSession) {
       return this.getSessionHistory();
@@ -1198,7 +2676,7 @@ export class AgentService extends EventEmitter {
     if (this.sessionMode === 'memory') {
       const rec = this.getWorkspaceMemoryMap().get(targetId);
       if (!rec) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
       rec.updatedAtMs = Date.now();
       rec.seq = ++this.memorySeq;
@@ -1208,7 +2686,7 @@ export class AgentService extends EventEmitter {
       const sessionDir = this.resolveSessionDir(this.activeWorkspace);
       const filePath = SessionManager.findById(this.activeWorkspace, targetId, sessionDir);
       if (!filePath) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
       this.bumpSessionFileMtime(filePath, sessionDir);
       this.disposeCurrentSessionState(true);
@@ -1222,12 +2700,12 @@ export class AgentService extends EventEmitter {
   }
 
   async deleteSession(sessionId: string): Promise<SessionHistoryState> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot delete session while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot delete session while a turn is in progress.', 409);
     }
     const targetId = sessionId.trim();
     if (!targetId) {
-      throw new Error('Session identifier cannot be empty.');
+      throw new AppError('Session identifier cannot be empty.', 400);
     }
 
     const isActive = this.sessionManager?.getSessionId?.() === targetId;
@@ -1235,7 +2713,7 @@ export class AgentService extends EventEmitter {
     if (this.sessionMode === 'memory') {
       const map = this.getWorkspaceMemoryMap();
       if (!map.has(targetId)) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
       map.delete(targetId);
       if (isActive) {
@@ -1245,7 +2723,7 @@ export class AgentService extends EventEmitter {
       const sessionDir = this.resolveSessionDir(this.activeWorkspace);
       const filePath = SessionManager.findById(this.activeWorkspace, targetId, sessionDir);
       if (!filePath) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
       const resolvedDir = path.resolve(sessionDir);
       const resolvedFile = path.resolve(filePath);
@@ -1296,8 +2774,8 @@ export class AgentService extends EventEmitter {
   }
 
   async pickWorkspaceFolder(initialDir?: string): Promise<FolderPickResult> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot pick workspace folder while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot pick workspace folder while a turn is in progress.', 409);
     }
     if (this.pickFolderInFlight) {
       return this.pickFolderInFlight;
@@ -1318,14 +2796,14 @@ export class AgentService extends EventEmitter {
   ): Promise<{ workspace: string; sessions: SessionSummary[] }> {
     const trimmed = workspacePath.trim();
     if (!trimmed) {
-      throw new Error('Workspace parameter cannot be empty.');
+      throw new AppError('Workspace parameter cannot be empty.', 400);
     }
     const resolved = path.resolve(trimmed);
     const targetKey = this.workspaceKey(resolved);
     const reg = this.getWorkspaces();
     const matched = reg.recent.find((p) => this.workspaceKey(p) === targetKey);
     if (!matched) {
-      throw new Error(`Workspace is not registered: ${resolved}`);
+      throw new AppError(`Workspace is not registered: ${resolved}`, 404, 'NOT_FOUND');
     }
     const sessions =
       targetKey === this.workspaceKey(this.activeWorkspace)
@@ -1338,21 +2816,21 @@ export class AgentService extends EventEmitter {
     workspacePath: string,
     sessionId: string
   ): Promise<{ workspaces: WorkspaceRegistry; session: SessionHistoryState }> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot switch workspace or session while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot switch workspace or session while a turn is in progress.', 409);
     }
     const trimmedWs = workspacePath.trim();
     const targetId = sessionId.trim();
     if (!trimmedWs) {
-      throw new Error('Workspace parameter cannot be empty.');
+      throw new AppError('Workspace parameter cannot be empty.', 400);
     }
     if (!targetId) {
-      throw new Error('Session identifier cannot be empty.');
+      throw new AppError('Session identifier cannot be empty.', 400);
     }
 
     const resolvedWs = path.resolve(trimmedWs);
     if (!fs.existsSync(resolvedWs) || !fs.statSync(resolvedWs).isDirectory()) {
-      throw new Error(`Directory does not exist: ${resolvedWs}`);
+      throw new AppError(`Directory does not exist: ${resolvedWs}`, 404, 'NOT_FOUND');
     }
 
     const targetKey = this.workspaceKey(resolvedWs);
@@ -1371,13 +2849,13 @@ export class AgentService extends EventEmitter {
     if (this.sessionMode === 'memory') {
       nextMemoryRecord = this.getWorkspaceMemoryMap(resolvedWs).get(targetId);
       if (!nextMemoryRecord) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
     } else {
       nextPersistDir = this.resolveSessionDir(resolvedWs);
       nextPersistFile = SessionManager.findById(resolvedWs, targetId, nextPersistDir);
       if (!nextPersistFile) {
-        throw new Error(`Session not found: ${targetId}`);
+        throw new AppError(`Session not found: ${targetId}`, 404, 'NOT_FOUND');
       }
     }
 
@@ -1410,6 +2888,9 @@ export class AgentService extends EventEmitter {
   }
 
   setWorkspace(newPath: string): string {
+    if (this.isBusy()) {
+      throw new AppError('Cannot switch workspace while a turn is in progress.', 409);
+    }
     const switched = this.workspaceManager.switchWorkspace(newPath);
     this.activeWorkspace = switched;
     this.invalidateEngineeringStatusCache();
@@ -1422,9 +2903,12 @@ export class AgentService extends EventEmitter {
   }
 
   removeWorkspace(targetPath: string): WorkspaceRegistry {
+    if (this.isBusy()) {
+      throw new AppError('Cannot remove workspace while a turn is in progress.', 409);
+    }
     this.workspaceManager.removeWorkspace(targetPath);
     const reg = this.workspaceManager.getRegistry();
-    if (reg.active !== this.activeWorkspace) {
+    if (this.workspaceKey(reg.active) !== this.workspaceKey(this.activeWorkspace)) {
       this.setWorkspace(reg.active);
     }
     return reg;
@@ -1460,23 +2944,27 @@ export class AgentService extends EventEmitter {
     }
 
     let detectedEngine = 'unknown';
+    let engineId: string | null = null;
+    let engineName: string | null = null;
+    let engineKnown = false;
     try {
-      const detected = detectVnEngines(this.activeWorkspace).trim();
+      const summary = detectVnEngineSummary(this.activeWorkspace);
+      const detected = summary.text.trim();
       if (detected) {
         detectedEngine = detected;
       }
+      engineId = summary.engineId;
+      engineName = summary.engineName;
+      engineKnown = summary.engineKnown;
     } catch {
       // Keep fallback 'unknown' when engine detection fails
     }
 
-    // unpacked および build フォルダの存在確認
-    const unpackedDir = path.join(this.activeWorkspace, 'unpacked');
-    const hasUnpacked = fs.existsSync(unpackedDir);
+    const wsPaths = resolveWorkspacePaths(this.activeWorkspace);
+    const hasUnpacked = fs.existsSync(wsPaths.unpackedDir);
+    const hasBuild = fs.existsSync(wsPaths.buildDir);
 
-    const buildDir = path.join(this.activeWorkspace, 'build');
-    const hasBuild = fs.existsSync(buildDir);
-
-    const planDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'plan.json'));
+    const planDoc = this.readWorkspaceJson(WORKSPACE_PLAN_REL);
     const planCfg = planDoc && typeof planDoc.config === 'object' ? planDoc.config : null;
     const planAnalysis = planDoc && typeof planDoc.analysis === 'object' ? planDoc.analysis : null;
     const plan = planCfg
@@ -1491,8 +2979,8 @@ export class AgentService extends EventEmitter {
         }
       : null;
 
-    const batchManifest = this.readWorkspaceJson(path.join('work', 'batches', 'manifest.json'));
-    const progressDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'progress.json'));
+    const batchManifest = this.readWorkspaceJson(WORKSPACE_BATCHES_MANIFEST_REL);
+    const progressDoc = this.readWorkspaceJson(WORKSPACE_PROGRESS_REL);
     const progressSummary = progressDoc && typeof progressDoc.summary === 'object' ? progressDoc.summary : null;
     const manifestBatches: any[] = Array.isArray(batchManifest?.batches) ? batchManifest.batches : [];
     const totalBatches = progressSummary
@@ -1508,6 +2996,18 @@ export class AgentService extends EventEmitter {
       ? Number(progressSummary.pending_batches ?? Math.max(0, totalBatches - savedPendingQa - qaPassed - qaFailed))
       : totalBatches;
     const checkedInRows = progressSummary ? Number(progressSummary.checked_in_rows || 0) : 0;
+    const rawRouteStats =
+      progressSummary && typeof progressSummary.route_stats === 'object'
+        ? (progressSummary.route_stats as Record<string, unknown>)
+        : null;
+    const routeStats = rawRouteStats
+      ? {
+          tmCache: Number(rawRouteStats.tm_cache || 0),
+          localMt: Number(rawRouteStats.local_mt || 0),
+          cloudEscalated: Number(rawRouteStats.cloud_escalated || 0),
+          cloudSubagent: Number(rawRouteStats.cloud_subagent || 0),
+        }
+      : undefined;
     const batchProgress =
       totalBatches > 0
         ? {
@@ -1518,10 +3018,11 @@ export class AgentService extends EventEmitter {
             qaFailed,
             totalRows,
             checkedInRows,
+            ...(routeStats ? { routeStats } : {}),
           }
         : null;
 
-    const cpDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'checkpoints.json'));
+    const cpDoc = this.readWorkspaceJson(WORKSPACE_CHECKPOINTS_REL);
     const cpList: any[] = Array.isArray(cpDoc?.checkpoints) ? cpDoc.checkpoints : [];
     const latestCp = cpList.length > 0 ? cpList[cpList.length - 1] : null;
     const checkpoints =
@@ -1540,7 +3041,7 @@ export class AgentService extends EventEmitter {
           }
         : null;
 
-    const postQaDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'post_qa_report.json'));
+    const postQaDoc = this.readWorkspaceJson(WORKSPACE_POST_QA_REPORT_REL);
     const postQa = postQaDoc
       ? {
           ok: Boolean(postQaDoc.ok),
@@ -1564,9 +3065,98 @@ export class AgentService extends EventEmitter {
         }
       : null;
 
+    const wsTranslatorOverride = loadWorkspaceTranslatorOverride(this.activeWorkspace);
+    const effectiveTranslator = mergeTranslatorConfig(this.translatorConfig, wsTranslatorOverride);
+    let ollamaRuntime:
+      | { running: boolean; version?: string; managedByPaperCup?: boolean }
+      | null = null;
+    if (effectiveTranslator.mode === 'local_mt') {
+      let origin = '';
+      let isLoopback = false;
+      try {
+        const parsed = new URL(effectiveTranslator.baseUrl);
+        origin = parsed.origin;
+        isLoopback = isLoopbackHostname(parsed.hostname);
+      } catch {
+        origin = '';
+      }
+      const isDefaultOllama = isLocalOllamaCandidate(effectiveTranslator.baseUrl);
+      const isKnownCustomOllama = Boolean(
+        origin && isLoopback && this.lastOllamaRuntime?.origin === origin && this.lastOllamaRuntime.running
+      );
+      if (isDefaultOllama || isKnownCustomOllama) {
+        const now = Date.now();
+        if (
+          origin &&
+          this.lastOllamaRuntime &&
+          this.lastOllamaRuntime.origin === origin &&
+          now - this.lastOllamaRuntime.checkedAt < ENGINEERING_STATUS_CACHE_TTL_MS
+        ) {
+          ollamaRuntime = {
+            running: this.lastOllamaRuntime.running,
+            ...(this.lastOllamaRuntime.version ? { version: this.lastOllamaRuntime.version } : {}),
+            managedByPaperCup: this.lastOllamaRuntime.managedByPaperCup,
+          };
+        } else if (origin && (this.sessionMode === 'persist' || Boolean(this.localTranslatorFetch))) {
+          try {
+            const fetchFn = this.localTranslatorFetch ?? globalThis.fetch;
+            const res = await fetchFn(`${origin}/api/version`, {
+              method: 'GET',
+              headers: { Accept: 'application/json' },
+              signal: AbortSignal.timeout(400),
+            });
+            if (res.ok) {
+              const payload: any = await res.json().catch(() => null);
+              const ver =
+                typeof payload?.version === 'string' && payload.version.trim() ? payload.version.trim() : undefined;
+              const managed = Boolean(
+                this.lastOllamaRuntime?.origin === origin && this.lastOllamaRuntime.managedByPaperCup
+              );
+              this.lastOllamaRuntime = {
+                origin,
+                running: true,
+                ...(ver ? { version: ver } : {}),
+                managedByPaperCup: managed,
+                checkedAt: now,
+              };
+              ollamaRuntime = {
+                running: true,
+                ...(ver ? { version: ver } : {}),
+                managedByPaperCup: managed,
+              };
+            } else {
+              ollamaRuntime = { running: false, managedByPaperCup: false };
+            }
+          } catch {
+            ollamaRuntime = { running: false, managedByPaperCup: false };
+          }
+        }
+      }
+    }
+
+    const translator = {
+      mode: effectiveTranslator.mode,
+      model: effectiveTranslator.model,
+      preset: effectiveTranslator.preset,
+      baseUrl: effectiveTranslator.baseUrl,
+      concurrency: effectiveTranslator.concurrency,
+      escalateFailedRows: effectiveTranslator.escalateFailedRows,
+      hasWorkspaceOverride: Boolean(wsTranslatorOverride),
+      ...(ollamaRuntime
+        ? {
+            ollamaRunning: ollamaRuntime.running,
+            ...(ollamaRuntime.version ? { ollamaVersion: ollamaRuntime.version } : {}),
+            ollamaManaged: ollamaRuntime.managedByPaperCup,
+          }
+        : {}),
+    };
+
     const statusDoc = {
       workspace: this.activeWorkspace,
       engine: detectedEngine,
+      engineId,
+      engineName,
+      engineKnown,
       rawStatus,
       hasUnpacked,
       hasBuild,
@@ -1575,6 +3165,7 @@ export class AgentService extends EventEmitter {
       batchProgress,
       checkpoints,
       postQa,
+      translator,
     };
     this.engineeringStatusCache.set(cacheKey, {
       value: statusDoc,
@@ -1590,6 +3181,7 @@ export class AgentService extends EventEmitter {
       id: String(model.id),
       name: String(model.name || model.id),
       reasoning: Boolean(model.reasoning),
+      supportsImage: modelSupportsImageInput(model),
     };
   }
 
@@ -1602,13 +3194,49 @@ export class AgentService extends EventEmitter {
     );
   }
 
+  private getCustomProviderBaseUrl(providerId: CustomOpenAIProviderId): string {
+    const override = this.customProviderBaseUrls.get(providerId);
+    if (override) return override;
+    const spec = CUSTOM_OPENAI_PROVIDERS[providerId];
+    const defaultBaseUrl = spec.resolveDefaultBaseUrl?.() ?? spec.baseUrl;
+    const persisted = this.persistedAuth.providers[providerId]?.baseUrl;
+    if (persisted && spec.supportsBaseUrl) {
+      try {
+        return spec.normalizeBaseUrl
+          ? spec.normalizeBaseUrl(persisted, defaultBaseUrl)
+          : persisted.replace(/\/+$/, '');
+      } catch {
+        // Fallback to default
+      }
+    }
+    return defaultBaseUrl;
+  }
+
+  private isProviderKeyless(providerId: CustomOpenAIProviderId, resolvedApiKey?: string): boolean {
+    const spec = CUSTOM_OPENAI_PROVIDERS[providerId];
+    if (!spec?.apiKeyOptional) return false;
+    if (this.runtimeApiKeys.has(providerId)) return false;
+    if (this.keylessRuntimeProviders.has(providerId)) return true;
+    const trimmed = String(resolvedApiKey ?? '').trim();
+    if (!trimmed || trimmed === MAGPIE_KEYLESS_RUNTIME_TOKEN) {
+      const envKey = spec.envVar ? process.env[spec.envVar]?.trim() : '';
+      return !envKey;
+    }
+    return false;
+  }
+
   private isProviderConfiguredInRuntime(runtime: any, providerId: string): boolean {
     if (this.clearedProviders.has(providerId)) {
       return false;
     }
     const authStatus = runtime?.getProviderAuthStatus?.(providerId);
     const hasAuthFallback = Boolean(runtime?.hasConfiguredAuth?.(providerId));
-    return Boolean(authStatus?.configured || hasAuthFallback || this.runtimeApiKeys.has(providerId));
+    return Boolean(
+      authStatus?.configured ||
+        hasAuthFallback ||
+        this.runtimeApiKeys.has(providerId) ||
+        this.keylessRuntimeProviders.has(providerId)
+    );
   }
 
   private isUserCustomModel(providerId: string, modelId: string): boolean {
@@ -1717,12 +3345,17 @@ export class AgentService extends EventEmitter {
       const isCleared = this.clearedProviders.has(id);
       const authStatus = runtime?.getProviderAuthStatus?.(id);
       const hasAuthFallback = Boolean(runtime?.hasConfiguredAuth?.(id));
+      const persistedRec = this.sessionMode === 'persist' ? this.persistedAuth.providers[id] : undefined;
+      const hasSavedLocalKey = Boolean(persistedRec?.apiKey || persistedRec?.keyless);
+      const hasRuntimeAuth = this.runtimeApiKeys.has(id) || this.keylessRuntimeProviders.has(id);
       const configured =
         !isCleared &&
-        Boolean(authStatus?.configured || hasAuthFallback || this.runtimeApiKeys.has(id));
+        Boolean(authStatus?.configured || hasAuthFallback || hasRuntimeAuth);
       let source: ProviderAuthSource = null;
       if (configured) {
-        if (authStatus?.source === 'runtime' || this.runtimeApiKeys.has(id)) {
+        if (hasSavedLocalKey && hasRuntimeAuth) {
+          source = 'stored';
+        } else if (authStatus?.source === 'runtime' || hasRuntimeAuth) {
           source = 'runtime';
         } else if (authStatus?.source === 'stored') {
           source = 'stored';
@@ -1738,13 +3371,33 @@ export class AgentService extends EventEmitter {
         ? availableCount
         : Math.max(availableCount, supportedCatalogCount);
 
+      const customSpec = isCustomOpenAIProviderId(id) ? CUSTOM_OPENAI_PROVIDERS[id] : undefined;
+      const supportsBaseUrl = Boolean(customSpec?.supportsBaseUrl);
+      const apiKeyOptional = Boolean(customSpec?.apiKeyOptional);
+      const baseUrl = supportsBaseUrl && customSpec ? this.getCustomProviderBaseUrl(customSpec.id) : undefined;
+      const defaultBaseUrl =
+        supportsBaseUrl && customSpec
+          ? customSpec.resolveDefaultBaseUrl?.() ?? customSpec.baseUrl
+          : undefined;
+      const hasApiKey =
+        apiKeyOptional && customSpec
+          ? Boolean(
+              this.runtimeApiKeys.has(id) ||
+                persistedRec?.apiKey ||
+                (customSpec.envVar && process.env[customSpec.envVar]?.trim())
+            )
+          : undefined;
+
       return {
         id,
         name,
         ...(envVar ? { envVar } : {}),
         configured,
         source,
+        ...(hasSavedLocalKey ? { savedLocally: true } : {}),
         modelCount,
+        ...(supportsBaseUrl ? { supportsBaseUrl: true, baseUrl, defaultBaseUrl } : {}),
+        ...(apiKeyOptional ? { apiKeyOptional: true, hasApiKey } : {}),
       };
     };
 
@@ -1758,7 +3411,7 @@ export class AgentService extends EventEmitter {
     const others = runtimeProviders
       .filter((p) => !featuredIds.has(String(p.id)))
       .map((p) => toStatus(String(p.id), String(p.name || p.id)))
-      .filter((p) => p.modelCount > 0 || p.configured)
+      .filter((p) => p.modelCount > 0 || p.configured || p.savedLocally)
       .sort((a, b) => a.name.localeCompare(b.name));
 
     return [...providers, ...others];
@@ -1824,8 +3477,8 @@ export class AgentService extends EventEmitter {
   }
 
   async setThinkingLevel(level: string): Promise<ModelsState> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot change thinking level while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot change thinking level while a turn is in progress.', 409);
     }
     const normalized = level.trim().toLowerCase() as ThinkingLevel;
     if (!VALID_THINKING_LEVELS.includes(normalized)) {
@@ -1837,6 +3490,10 @@ export class AgentService extends EventEmitter {
     }
     const resolved = (this.currentSession?.thinkingLevel as ThinkingLevel) || normalized;
     this.preferredThinkingLevel = resolved;
+    if (this.sessionMode === 'persist') {
+      this.persistedAuth.preferredThinkingLevel = resolved;
+      this.savePersistedAuth();
+    }
     const nextState = await this.getModelsState();
     this.emitEvent('thinking_changed', { thinkingLevel: nextState.thinkingLevel });
     this.emitEvent('models_updated', nextState);
@@ -1880,14 +3537,21 @@ export class AgentService extends EventEmitter {
     if (!cleanId) {
       return '';
     }
+    const effectiveBaseUrl = this.getCustomProviderBaseUrl(providerId);
     const baseModels = this.liveCustomProviderModels.get(providerId) ?? DEFAULT_CUSTOM_PROVIDER_MODELS[providerId];
     let customMap = this.customProviderModels.get(providerId);
     if (!customMap) {
       customMap = new Map<string, any>();
       this.customProviderModels.set(providerId, customMap);
     }
-    if (!baseModels.some((m) => m.id === cleanId) && !customMap.has(cleanId)) {
-      customMap.set(cleanId, buildCustomOpenAIModelDefinition(spec, cleanId));
+    if (!baseModels.some((m) => m.id === cleanId)) {
+      const existing = customMap.get(cleanId);
+      if (!existing || existing.baseUrl !== effectiveBaseUrl) {
+        customMap.set(
+          cleanId,
+          buildCustomOpenAIModelDefinition(spec, cleanId, undefined, undefined, effectiveBaseUrl)
+        );
+      }
     }
     return cleanId;
   }
@@ -1907,6 +3571,9 @@ export class AgentService extends EventEmitter {
     if (liveModels.length === 0 && rawModelCount === 0) {
       this.liveProviderModelAllowlist.delete(providerId);
       this.liveDynamicProviderModels.delete(providerId);
+      if (isCustomOpenAIProviderId(providerId)) {
+        this.liveCustomProviderModels.delete(providerId);
+      }
       return;
     }
 
@@ -1917,24 +3584,49 @@ export class AgentService extends EventEmitter {
 
     if (isCustomOpenAIProviderId(providerId)) {
       const spec = CUSTOM_OPENAI_PROVIDERS[providerId];
+      const effectiveBaseUrl = this.getCustomProviderBaseUrl(providerId);
       const defaults = DEFAULT_CUSTOM_PROVIDER_MODELS[providerId];
       const defaultById = new Map(defaults.map((m) => [m.id, m]));
-      const liveIds = new Set(liveModels.map((m) => m.id));
+      const liveById = new Map(liveModels.map((m) => [m.id, m]));
       const ordered: any[] = [];
       for (const preset of defaults) {
-        if (liveIds.has(preset.id)) {
-          ordered.push(preset);
+        const liveItem = liveById.get(preset.id);
+        if (liveItem) {
+          const validCtx =
+            typeof liveItem.contextWindow === 'number' &&
+            Number.isFinite(liveItem.contextWindow) &&
+            liveItem.contextWindow >= 2048
+              ? Math.floor(liveItem.contextWindow)
+              : undefined;
+          ordered.push(
+            preset.baseUrl === effectiveBaseUrl && validCtx === undefined
+              ? preset
+              : {
+                  ...preset,
+                  baseUrl: effectiveBaseUrl,
+                  ...(validCtx !== undefined ? { contextWindow: validCtx } : {}),
+                }
+          );
         }
       }
       for (const item of liveModels) {
         if (!defaultById.has(item.id)) {
           ordered.push(
-            buildCustomOpenAIModelDefinition(spec, item.id, item.name, item.reasoning)
+            buildCustomOpenAIModelDefinition(
+              spec,
+              item.id,
+              item.name,
+              item.reasoning,
+              effectiveBaseUrl,
+              item.contextWindow
+            )
           );
         }
       }
       if (ordered.length > 0) {
         this.liveCustomProviderModels.set(providerId, ordered);
+      } else {
+        this.liveCustomProviderModels.delete(providerId);
       }
       this.liveDynamicProviderModels.delete(providerId);
       return;
@@ -1965,11 +3657,18 @@ export class AgentService extends EventEmitter {
               ...(!item.reasoning ? { requiresReasoningContentOnAssistantMessages: false } : {}),
             }
           : template.compat;
+      const validCtx =
+        typeof item.contextWindow === 'number' &&
+        Number.isFinite(item.contextWindow) &&
+        item.contextWindow >= 2048
+          ? Math.floor(item.contextWindow)
+          : inferContextWindowFromModelId(item.id);
       synthesized.push({
         ...template,
         id: item.id,
         name: item.name || item.id,
         reasoning: item.reasoning,
+        ...(validCtx !== undefined ? { contextWindow: validCtx } : {}),
         ...(clonedCompat ? { compat: clonedCompat } : {}),
       });
     }
@@ -2015,25 +3714,55 @@ export class AgentService extends EventEmitter {
       ? targetIds.map((id) => CUSTOM_OPENAI_PROVIDERS[id])
       : CUSTOM_OPENAI_PROVIDER_LIST;
     for (const spec of specs) {
+      const effectiveBaseUrl = this.getCustomProviderBaseUrl(spec.id);
       const baseModels = this.liveCustomProviderModels.get(spec.id) ?? DEFAULT_CUSTOM_PROVIDER_MODELS[spec.id];
       const mergedById = new Map<string, any>();
       for (const model of baseModels) {
-        mergedById.set(model.id, model);
+        mergedById.set(
+          model.id,
+          model.baseUrl === effectiveBaseUrl ? model : { ...model, baseUrl: effectiveBaseUrl }
+        );
       }
       const customMap = this.customProviderModels.get(spec.id);
       if (customMap) {
         for (const [id, model] of customMap) {
           if (!mergedById.has(id)) {
-            mergedById.set(id, model);
+            mergedById.set(
+              id,
+              model.baseUrl === effectiveBaseUrl ? model : { ...model, baseUrl: effectiveBaseUrl }
+            );
           }
         }
       }
       runtime.registerProvider(spec.id, {
         name: spec.name,
-        baseUrl: spec.baseUrl,
+        baseUrl: effectiveBaseUrl,
         api: 'openai-completions',
         apiKey: spec.resolveApiKeyRef(),
         models: Array.from(mergedById.values()),
+        ...(spec.apiKeyOptional
+          ? {
+              streamSimple: (model: any, context: any, streamOptions?: any) => {
+                if (!this.isProviderKeyless(spec.id, streamOptions?.apiKey)) {
+                  return openAiCompletionsStreamSimple(model, context, streamOptions);
+                }
+                const nextHeaders = streamOptions?.headers ? { ...streamOptions.headers } : undefined;
+                if (nextHeaders) {
+                  for (const key of Object.keys(nextHeaders)) {
+                    if (key.toLowerCase() === 'authorization') {
+                      delete nextHeaders[key];
+                    }
+                  }
+                }
+                return openAiCompletionsStreamSimple(model, context, {
+                  ...streamOptions,
+                  apiKey: streamOptions?.apiKey || MAGPIE_KEYLESS_RUNTIME_TOKEN,
+                  ...(nextHeaders ? { headers: nextHeaders } : {}),
+                  fetch: createKeylessFetchWrapper(streamOptions?.fetch),
+                });
+              },
+            }
+          : {}),
       });
     }
     await runtime.refresh?.({ allowNetwork: false, providers: specs.map((s) => s.id) });
@@ -2042,26 +3771,74 @@ export class AgentService extends EventEmitter {
   async setProviderApiKey(
     providerId: string,
     apiKey: string,
-    customModelId?: string
+    customModelId?: string,
+    options?: { useStored?: boolean; baseUrl?: string; clear?: boolean }
   ): Promise<ApiKeyUpdateResult> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot update API key while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot update API key while a turn is in progress.', 409);
     }
+    const requestedClear = options?.clear === true;
+    const useStored = options?.useStored === true;
     const trimmedKey = apiKey.trim();
     const rawProvider = providerId.trim();
     const isAuto = !rawProvider || rawProvider.toLowerCase() === 'auto';
     if (!rawProvider && !trimmedKey) {
       throw new Error('Provider identifier cannot be empty.');
     }
+    if (requestedClear && isAuto) {
+      throw new Error('请先选择具体的提供商以清除配置。');
+    }
+    if (useStored && isAuto) {
+      throw new Error('请先选择具体的提供商以启用已保存的本地凭据。');
+    }
 
     await this.initSession();
     const runtime = this.currentSession?.modelRuntime;
     const knownProviders: readonly any[] = runtime?.getProviders?.() ?? [];
 
+    let savedRecord =
+      !isAuto && this.sessionMode === 'persist'
+        ? this.persistedAuth.providers[rawProvider]
+        : undefined;
+    const isOptionalKeyProvider =
+      !isAuto &&
+      isCustomOpenAIProviderId(rawProvider) &&
+      Boolean(CUSTOM_OPENAI_PROVIDERS[rawProvider].apiKeyOptional);
+    const isClear = requestedClear || (!isOptionalKeyProvider && !trimmedKey && !useStored);
+
+    let effectiveKey = trimmedKey;
+    if (!isClear && useStored && !effectiveKey) {
+      if (savedRecord?.apiKey) {
+        effectiveKey = savedRecord.apiKey;
+      } else if (isOptionalKeyProvider && savedRecord?.keyless) {
+        effectiveKey = '';
+      } else if (!isOptionalKeyProvider) {
+        throw new Error('该提供商尚未保存本地凭据，请先输入 API Key。');
+      }
+    }
+
+    let effectiveBaseUrl: string | undefined;
+    if (
+      !isClear &&
+      !isAuto &&
+      isCustomOpenAIProviderId(rawProvider) &&
+      CUSTOM_OPENAI_PROVIDERS[rawProvider].supportsBaseUrl
+    ) {
+      const spec = CUSTOM_OPENAI_PROVIDERS[rawProvider];
+      const requestedBaseUrl = options?.baseUrl?.trim();
+      const defaultBaseUrl = spec.resolveDefaultBaseUrl?.() ?? spec.baseUrl;
+      const fallbackBaseUrl =
+        savedRecord?.baseUrl || this.getCustomProviderBaseUrl(rawProvider);
+      effectiveBaseUrl = spec.normalizeBaseUrl
+        ? spec.normalizeBaseUrl(requestedBaseUrl || fallbackBaseUrl, defaultBaseUrl)
+        : (requestedBaseUrl || fallbackBaseUrl).replace(/\/+$/, '');
+    }
+
     let trimmedProvider = rawProvider;
     let detectionMeta: Omit<ApiKeyUpdateResult, keyof ModelsState> = {};
+    let discoveredLiveModels: readonly DiscoveredLiveModel[] | null = null;
 
-    if (trimmedKey) {
+    if (!isClear) {
       if (!isAuto) {
         const providerExists = Boolean(
           runtime?.getProvider?.(trimmedProvider) ||
@@ -2074,10 +3851,13 @@ export class AgentService extends EventEmitter {
 
       const discovery = await discoverProviderAndModels({
         requestedProvider: isAuto ? 'auto' : trimmedProvider,
-        apiKey: trimmedKey,
+        apiKey: effectiveKey,
+        ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
         fetchImpl: this.probeFetch,
       });
       trimmedProvider = discovery.provider;
+      savedRecord =
+        this.sessionMode === 'persist' ? this.persistedAuth.providers[trimmedProvider] : undefined;
 
       const resolvedExists = Boolean(
         runtime?.getProvider?.(trimmedProvider) ||
@@ -2087,11 +3867,40 @@ export class AgentService extends EventEmitter {
         throw new Error(`Unknown provider: ${trimmedProvider}`);
       }
 
+      discoveredLiveModels = discovery.liveModels;
+      const fallbackCachedLiveModels =
+        discovery.liveModels === null && useStored && savedRecord?.liveModels?.length
+          ? savedRecord.liveModels
+          : null;
+      const effectiveLiveModels = discovery.liveModels ?? fallbackCachedLiveModels;
+      const effectiveRawCount = discovery.liveModels
+        ? discovery.rawModelCount
+        : (fallbackCachedLiveModels?.length ?? 0);
+
+      if (
+        isCustomOpenAIProviderId(trimmedProvider) &&
+        CUSTOM_OPENAI_PROVIDERS[trimmedProvider].presets.length === 0 &&
+        discovery.liveModels !== null &&
+        discovery.liveModels.length === 0 &&
+        !customModelId?.trim() &&
+        !(savedRecord?.customModels?.length)
+      ) {
+        const spec = CUSTOM_OPENAI_PROVIDERS[trimmedProvider];
+        throw new Error(
+          `已连接 ${spec.name} (${effectiveBaseUrl ?? this.getCustomProviderBaseUrl(trimmedProvider)})，但 /models 未返回可用的对话模型；请先在网关中配置上游渠道，或在下方填写自定义模型 ID。`
+        );
+      }
+
+      if (effectiveBaseUrl && isCustomOpenAIProviderId(trimmedProvider)) {
+        this.customProviderBaseUrls.set(trimmedProvider, effectiveBaseUrl);
+        clearReasoningOffFallbackCache(trimmedProvider);
+      }
+
       this.applyDiscoveredLiveModels(
         runtime,
         trimmedProvider,
-        discovery.liveModels,
-        discovery.rawModelCount
+        effectiveLiveModels,
+        effectiveRawCount
       );
 
       detectionMeta = {
@@ -2115,21 +3924,40 @@ export class AgentService extends EventEmitter {
       }
       this.liveProviderModelAllowlist.delete(trimmedProvider);
       this.liveDynamicProviderModels.delete(trimmedProvider);
+      if (isCustomOpenAIProviderId(trimmedProvider)) {
+        this.customProviderModels.delete(trimmedProvider);
+        this.liveCustomProviderModels.delete(trimmedProvider);
+        this.customProviderBaseUrls.delete(trimmedProvider);
+        clearReasoningOffFallbackCache(trimmedProvider);
+      }
     }
 
     let preferredCustomModelId = '';
-    if (trimmedKey && isCustomOpenAIProviderId(trimmedProvider)) {
+    if (!isClear && isCustomOpenAIProviderId(trimmedProvider)) {
+      if (savedRecord?.customModels) {
+        for (const cm of savedRecord.customModels) {
+          this.registerCustomProviderModel(trimmedProvider, cm);
+        }
+      }
       if (customModelId?.trim()) {
         preferredCustomModelId = this.registerCustomProviderModel(trimmedProvider, customModelId);
       }
       await this.ensureCustomProvidersRegistered(runtime, [trimmedProvider]);
+    } else if (isClear && isCustomOpenAIProviderId(trimmedProvider)) {
+      await this.ensureCustomProvidersRegistered(runtime, [trimmedProvider]);
     }
 
-    if (trimmedKey) {
+    if (!isClear) {
       for (const prevProvider of Array.from(this.runtimeApiKeys.keys())) {
         if (prevProvider !== trimmedProvider) {
           await runtime.removeRuntimeApiKey(prevProvider);
           this.runtimeApiKeys.delete(prevProvider);
+        }
+      }
+      for (const prevKeyless of Array.from(this.keylessRuntimeProviders)) {
+        if (prevKeyless !== trimmedProvider) {
+          await runtime.removeRuntimeApiKey(prevKeyless);
+          this.keylessRuntimeProviders.delete(prevKeyless);
         }
       }
       for (const p of knownProviders) {
@@ -2145,11 +3973,19 @@ export class AgentService extends EventEmitter {
         }
       }
       this.clearedProviders.delete(trimmedProvider);
-      await runtime.setRuntimeApiKey(trimmedProvider, trimmedKey);
-      this.runtimeApiKeys.set(trimmedProvider, trimmedKey);
+      if (effectiveKey) {
+        await runtime.setRuntimeApiKey(trimmedProvider, effectiveKey);
+        this.runtimeApiKeys.set(trimmedProvider, effectiveKey);
+        this.keylessRuntimeProviders.delete(trimmedProvider);
+      } else {
+        await runtime.setRuntimeApiKey(trimmedProvider, MAGPIE_KEYLESS_RUNTIME_TOKEN);
+        this.runtimeApiKeys.delete(trimmedProvider);
+        this.keylessRuntimeProviders.add(trimmedProvider);
+      }
     } else {
       await runtime.removeRuntimeApiKey(trimmedProvider);
       this.runtimeApiKeys.delete(trimmedProvider);
+      this.keylessRuntimeProviders.delete(trimmedProvider);
       this.clearedProviders.add(trimmedProvider);
     }
 
@@ -2159,18 +3995,33 @@ export class AgentService extends EventEmitter {
     const isCurrentAvailable = Boolean(
       currentKey && available.some((m) => `${m.provider}/${m.id}` === currentKey)
     );
+    const currentBaseUrlChanged = Boolean(
+      effectiveBaseUrl &&
+        current &&
+        current.provider === trimmedProvider &&
+        current.baseUrl !== effectiveBaseUrl
+    );
 
-    if (trimmedKey) {
+    if (!isClear) {
       if (
         !current ||
         !isCurrentAvailable ||
         current.provider !== trimmedProvider ||
-        Boolean(preferredCustomModelId && current.id !== preferredCustomModelId)
+        Boolean(preferredCustomModelId && current.id !== preferredCustomModelId) ||
+        currentBaseUrlChanged
       ) {
         const providerModels = available.filter((m) => m.provider === trimmedProvider);
-        const nextModel = this.pickDefaultProviderModel(providerModels, preferredCustomModelId);
+        const keepSameId =
+          currentBaseUrlChanged && !preferredCustomModelId && current?.id
+            ? String(current.id)
+            : undefined;
+        const nextModel = this.pickDefaultProviderModel(
+          providerModels,
+          preferredCustomModelId || keepSameId
+        );
         if (nextModel) {
           await this.currentSession.setModel(nextModel);
+          this.syncMainCompactionSettings();
           if (this.preferredThinkingLevel && typeof this.currentSession.setThinkingLevel === 'function') {
             try {
               this.currentSession.setThinkingLevel(this.preferredThinkingLevel);
@@ -2194,6 +4045,7 @@ export class AgentService extends EventEmitter {
       const fallbackModel = available[0];
       if (fallbackModel) {
         await this.currentSession.setModel(fallbackModel);
+        this.syncMainCompactionSettings();
         const fallbackKey = `${fallbackModel.provider}/${fallbackModel.id}`;
         this.preferredModelKey = fallbackKey;
         this.emitEvent('model_changed', {
@@ -2204,6 +4056,67 @@ export class AgentService extends EventEmitter {
         });
       } else {
         this.clearActiveSessionModel(true);
+      }
+    }
+
+    if (this.sessionMode === 'persist') {
+      if (!isClear) {
+        const prevRec = this.persistedAuth.providers[trimmedProvider];
+        const mergedCustom: string[] = [];
+        const seenCustom = new Set<string>();
+        const pushCustom = (id: string) => {
+          const clean = id.trim();
+          if (clean && !seenCustom.has(clean)) {
+            seenCustom.add(clean);
+            mergedCustom.push(clean);
+          }
+        };
+        if (prevRec?.customModels) {
+          for (const cm of prevRec.customModels) pushCustom(cm);
+        }
+        if (isCustomOpenAIProviderId(trimmedProvider)) {
+          const customMap = this.customProviderModels.get(trimmedProvider);
+          if (customMap) {
+            for (const cm of customMap.keys()) pushCustom(cm);
+          }
+        }
+        if (preferredCustomModelId) {
+          pushCustom(preferredCustomModelId);
+        }
+
+        const nextLiveModels =
+          discoveredLiveModels && discoveredLiveModels.length > 0
+            ? [...discoveredLiveModels]
+            : discoveredLiveModels === null
+              ? prevRec?.liveModels
+              : undefined;
+
+        this.persistedAuth.providers[trimmedProvider] = {
+          ...(effectiveKey ? { apiKey: effectiveKey } : { keyless: true }),
+          ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
+          ...(mergedCustom.length > 0 ? { customModels: mergedCustom } : {}),
+          ...(nextLiveModels && nextLiveModels.length > 0 ? { liveModels: nextLiveModels } : {}),
+          updatedAt: new Date().toISOString(),
+        };
+        this.persistedAuth.activeProvider = trimmedProvider;
+        const activeSessionModel = this.currentSession?.model
+          ? `${this.currentSession.model.provider}/${this.currentSession.model.id}`
+          : null;
+        if (!this.preferredModelKey && activeSessionModel) {
+          this.preferredModelKey = activeSessionModel;
+        }
+        this.persistedAuth.preferredModel = this.preferredModelKey ?? activeSessionModel;
+        this.persistedAuth.preferredThinkingLevel = this.preferredThinkingLevel;
+        this.savePersistedAuth();
+      } else {
+        delete this.persistedAuth.providers[trimmedProvider];
+        if (this.persistedAuth.activeProvider === trimmedProvider) {
+          this.persistedAuth.activeProvider = null;
+        }
+        if (this.persistedAuth.preferredModel?.startsWith(`${trimmedProvider}/`)) {
+          this.persistedAuth.preferredModel = null;
+        }
+        this.savePersistedAuth();
       }
     }
 
@@ -2251,10 +4164,149 @@ export class AgentService extends EventEmitter {
   }
 
   async warmup(): Promise<void> {
-    await Promise.allSettled([
+    const tasks: Array<Promise<unknown>> = [
       this.initSession().then(() => this.warmProviderApi(this.currentSession?.model?.api)),
       this.warmProviderApi('openai-completions'),
-    ]);
+    ];
+    const effective = this.getEffectiveTranslatorConfig();
+    if (
+      (this.sessionMode === 'persist' || Boolean(this.ollamaSyncer)) &&
+      effective.mode === 'local_mt' &&
+      isLocalOllamaCandidate(effective.baseUrl)
+    ) {
+      tasks.push(
+        this.runOllamaSyncManaged({
+          baseUrl: effective.baseUrl,
+          concurrency: effective.concurrency,
+          ollamaPath: effective.ollamaPath,
+          forceRestart: false,
+        }).catch(() => undefined)
+      );
+    }
+    await Promise.allSettled(tasks);
+  }
+
+  private async hydratePersistedAuthIntoRuntime(runtime: any): Promise<void> {
+    if (this.sessionMode === 'persist') {
+      const activeProvider = this.persistedAuth.activeProvider;
+      const activeRec = activeProvider ? this.persistedAuth.providers[activeProvider] : undefined;
+      if (activeProvider && activeRec && (activeRec.apiKey || activeRec.keyless)) {
+        const knownProviders: readonly any[] = runtime?.getProviders?.() ?? [];
+        const providerExists = Boolean(
+          runtime?.getProvider?.(activeProvider) || knownProviders.some((p) => p.id === activeProvider)
+        );
+        if (!providerExists) {
+          return;
+        }
+
+        if (
+          activeRec.baseUrl &&
+          isCustomOpenAIProviderId(activeProvider) &&
+          CUSTOM_OPENAI_PROVIDERS[activeProvider].supportsBaseUrl
+        ) {
+          const spec = CUSTOM_OPENAI_PROVIDERS[activeProvider];
+          try {
+            const defaultBaseUrl = spec.resolveDefaultBaseUrl?.() ?? spec.baseUrl;
+            this.customProviderBaseUrls.set(
+              activeProvider,
+              spec.normalizeBaseUrl
+                ? spec.normalizeBaseUrl(activeRec.baseUrl, defaultBaseUrl)
+                : activeRec.baseUrl.replace(/\/+$/, '')
+            );
+          } catch {
+            // Ignore malformed persisted baseUrl
+          }
+        }
+
+        if (activeRec.liveModels && activeRec.liveModels.length > 0) {
+          this.applyDiscoveredLiveModels(
+            runtime,
+            activeProvider,
+            activeRec.liveModels,
+            activeRec.liveModels.length
+          );
+        }
+
+        if (isCustomOpenAIProviderId(activeProvider)) {
+          if (Array.isArray(activeRec.customModels)) {
+            for (const cm of activeRec.customModels) {
+              this.registerCustomProviderModel(activeProvider, cm);
+            }
+          }
+          await this.ensureCustomProvidersRegistered(runtime, [activeProvider]);
+        }
+
+        for (const p of knownProviders) {
+          const pid = String(p.id);
+          if (pid !== activeProvider && this.isProviderConfiguredInRuntime(runtime, pid)) {
+            this.clearedProviders.add(pid);
+          }
+        }
+        for (const m of runtime?.getAvailableSnapshot?.() ?? []) {
+          const pid = String(m.provider);
+          if (pid !== activeProvider) {
+            this.clearedProviders.add(pid);
+          }
+        }
+        this.clearedProviders.delete(activeProvider);
+
+        if (activeRec.apiKey) {
+          await runtime.setRuntimeApiKey(activeProvider, activeRec.apiKey);
+          this.runtimeApiKeys.set(activeProvider, activeRec.apiKey);
+          this.keylessRuntimeProviders.delete(activeProvider);
+        } else if (activeRec.keyless) {
+          await runtime.setRuntimeApiKey(activeProvider, MAGPIE_KEYLESS_RUNTIME_TOKEN);
+          this.runtimeApiKeys.delete(activeProvider);
+          this.keylessRuntimeProviders.add(activeProvider);
+        }
+        return;
+      }
+    }
+
+    // Best-effort env-var hydration for baseUrl-configurable custom providers (e.g. Magpie)
+    for (const spec of CUSTOM_OPENAI_PROVIDER_LIST) {
+      if (!spec.supportsBaseUrl || this.clearedProviders.has(spec.id)) continue;
+      const envKey = spec.envVar ? process.env[spec.envVar]?.trim() || '' : '';
+      const envBase = spec.baseUrlEnvVar ? process.env[spec.baseUrlEnvVar]?.trim() || '' : '';
+      const envModel = spec.modelEnvVar ? process.env[spec.modelEnvVar]?.trim() || '' : '';
+      if (!envKey && !envBase) continue;
+
+      const effectiveBase = spec.resolveDefaultBaseUrl?.() ?? spec.baseUrl;
+      this.customProviderBaseUrls.set(spec.id, effectiveBase);
+      if (!envKey && spec.apiKeyOptional) {
+        this.keylessRuntimeProviders.add(spec.id);
+      }
+      let updated = false;
+      if (process.env.PI_OFFLINE === undefined || Boolean(this.probeFetch)) {
+        try {
+          const discovery = await discoverProviderAndModels({
+            requestedProvider: spec.id,
+            apiKey: envKey,
+            baseUrl: effectiveBase,
+            fetchImpl: this.probeFetch,
+            timeoutMs: 2500,
+          });
+          if (discovery.liveModels && discovery.liveModels.length > 0) {
+            this.applyDiscoveredLiveModels(
+              runtime,
+              spec.id,
+              discovery.liveModels,
+              discovery.rawModelCount
+            );
+            updated = true;
+          }
+        } catch {
+          // Non-fatal: local gateway may not be started yet at server boot
+        }
+      }
+      if (envModel) {
+        this.registerCustomProviderModel(spec.id, envModel);
+        updated = true;
+      }
+      if (updated) {
+        await this.ensureCustomProvidersRegistered(runtime, [spec.id]);
+      }
+    }
   }
 
   private async getOrCreateModelRuntime(): Promise<any> {
@@ -2265,11 +4317,12 @@ export class AgentService extends EventEmitter {
       return this.sharedModelRuntimePromise;
     }
     const pending = (async () => {
-      const runtime = await ModelRuntime.create();
+      const runtime = wrapModelRuntimeWithReasoningOffFallback(await ModelRuntime.create());
       if (!this.customProvidersInitialized) {
         await this.ensureCustomProvidersRegistered(runtime);
         this.customProvidersInitialized = true;
       }
+      await this.hydratePersistedAuthIntoRuntime(runtime);
       this.sharedModelRuntime = runtime;
       return runtime;
     })().finally(() => {
@@ -2282,9 +4335,18 @@ export class AgentService extends EventEmitter {
   }
 
   async selectModel(modelRef: string): Promise<ModelsState> {
-    if (this.isRunningTurn) {
-      throw new Error('Cannot switch model while a turn is in progress.');
+    if (this.isBusy()) {
+      throw new AppError('Cannot switch model while a turn is in progress.', 409);
     }
+    return this.selectModelInternal(modelRef);
+  }
+
+  private syncMainCompactionSettings(): void {
+    if (!this.settingsManager) return;
+    applyCompactionSettingsForModel(this.settingsManager, this.currentSession?.model, 'main');
+  }
+
+  private async selectModelInternal(modelRef: string): Promise<ModelsState> {
     await this.initSession();
     const trimmedRef = modelRef.trim();
     const slashIdx = trimmedRef.indexOf('/');
@@ -2307,6 +4369,7 @@ export class AgentService extends EventEmitter {
 
     if (!current || `${current.provider}/${current.id}` !== targetKey) {
       await this.currentSession.setModel(target);
+      this.syncMainCompactionSettings();
       if (this.preferredThinkingLevel && typeof this.currentSession.setThinkingLevel === 'function') {
         try {
           this.currentSession.setThinkingLevel(this.preferredThinkingLevel);
@@ -2320,9 +4383,17 @@ export class AgentService extends EventEmitter {
         id: target.id,
         name: target.name || target.id,
       });
+      this.emitEvent('token_usage', this.getSessionTokenUsage());
     }
     void this.warmProviderApi(target?.api);
     this.preferredModelKey = targetKey;
+    if (this.sessionMode === 'persist') {
+      this.persistedAuth.preferredModel = targetKey;
+      if (isCustomOpenAIProviderId(target.provider) && this.isUserCustomModel(target.provider, target.id)) {
+        this.recordCustomModelInPersistedAuth(target.provider, target.id);
+      }
+      this.savePersistedAuth();
+    }
     return this.getModelsState();
   }
 
@@ -2405,11 +4476,25 @@ export class AgentService extends EventEmitter {
         this.emitEvent('subagent_task_updated', summary);
       };
       this.subagentManager.setOnTaskUpdated(handleSubagentTaskUpdated);
+      this.subagentManager.setOnStreamDelta((ev: SubagentStreamDeltaEvent) => {
+        this.emitEvent('subagent_stream_delta', ev);
+      });
+      this.subagentManager.setOnQueueUpdated((ev: SubagentQueueUpdatedEvent) => {
+        this.emitEvent('subagent_queue_updated', ev);
+      });
+      this.subagentManager.setOnQueueRestored((ev: SubagentQueueRestoredEvent) => {
+        this.emitEvent('subagent_queue_restored', ev);
+      });
+      this.subagentManager.setOnUsage((ev) => {
+        this.recordSessionUsage(ev.usageKind, ev.provider, ev.model, ev.usage, {
+          sessionId: ev.sessionId,
+        });
+      });
 
       const vnTools = createVnTools(() => this.activeWorkspace, {
         onSkillChanged: () => this.refreshLoadedSkills(),
         getTurnSignal: () => this.activeTurnAbortController?.signal,
-        getKnownSecrets: () => this.runtimeApiKeys.values(),
+        getKnownSecrets: () => this.getAllKnownSecrets(),
         subagentManager: this.subagentManager,
         getModel: () => this.currentSession?.model,
         getModelRuntime: () => this.currentSession?.modelRuntime,
@@ -2421,16 +4506,63 @@ export class AgentService extends EventEmitter {
           this.emitEvent('batch_progress', progress);
         },
         onTaskUpdated: handleSubagentTaskUpdated,
+        getTranslatorConfig: () => this.getEffectiveTranslatorConfig(),
+        getPublicTranslatorConfig: () => toPublicTranslatorConfig(this.getEffectiveTranslatorConfig()),
+        localTranslatorFetch: this.localTranslatorFetch,
+        ensureLocalEndpointReady: async (cfg) => {
+          if (
+            cfg.mode === 'local_mt' &&
+            isLocalOllamaCandidate(cfg.baseUrl) &&
+            (this.ollamaSyncer || this.sessionMode === 'persist')
+          ) {
+            const res = await this.runOllamaSyncManaged({
+              baseUrl: cfg.baseUrl,
+              concurrency: cfg.concurrency,
+              ollamaPath: cfg.ollamaPath,
+              forceRestart: false,
+            });
+            if (res.status === 'failed') {
+              throw new LocalTranslatorEndpointError(res.message || '自动启动本机 Ollama 失败。');
+            }
+          }
+        },
+        onLocalUsage: (delta: LocalUsageDelta) => {
+          const piUsage: Usage = {
+            input: delta.input,
+            output: delta.output,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: delta.totalTokens,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          };
+          this.recordSessionUsage('local_mt:translator', 'local_mt', delta.model || 'local', piUsage, {
+            sessionId: this.sessionManager?.getSessionId?.() ?? null,
+            note: delta.estimated ? 'estimated' : undefined,
+          });
+        },
+        smokeDriver: this.smokeDriver,
+        onVisionUsage: (provider, modelId, usage) => {
+          this.recordSessionUsage('cloud:smoke-vision', provider, modelId, usage, {
+            sessionId: this.sessionManager?.getSessionId?.() ?? null,
+          });
+        },
+        onChatFormUpdated: (form) => {
+          this.invalidateEngineeringStatusCache();
+          this.emitEvent('chat_form_updated', form);
+        },
+      });
+      const reverserTools = createReverserTools(() => this.activeWorkspace, {
+        getKnownSecrets: () => this.getAllKnownSecrets(),
       });
       const subagentTools = this.subagentManager.createTools(
         () => this.activeWorkspace,
         emitSubagentActivity,
         () => this.currentSession?.model,
-        () => vnTools,
+        () => [...vnTools, ...reverserTools],
         () => this.currentSession?.modelRuntime,
         {
           turnAbortSignalProvider: () => this.activeTurnAbortController?.signal,
-          getKnownSecrets: () => this.runtimeApiKeys.values(),
+          getKnownSecrets: () => this.getAllKnownSecrets(),
           sessionIdProvider: () => this.sessionManager?.getSessionId?.() ?? null,
           recordDiagnosticsProvider: () => this.sessionMode === 'persist',
           onTaskUpdated: handleSubagentTaskUpdated,
@@ -2440,24 +4572,21 @@ export class AgentService extends EventEmitter {
       if (!this.sessionManager) {
         if (this.sessionMode === 'memory') {
           const map = this.getWorkspaceMemoryMap();
-          const latest = Array.from(map.values()).sort(
-            (a, b) => b.updatedAtMs - a.updatedAtMs || b.seq - a.seq
-          )[0];
-          if (latest) {
-            this.sessionManager = latest.manager;
-          } else {
-            const fresh = SessionManager.inMemory(this.activeWorkspace);
-            map.set(fresh.getSessionId(), {
-              manager: fresh,
-              updatedAtMs: Date.now(),
-              seq: ++this.memorySeq,
-            });
-            this.sessionManager = fresh;
-          }
+          const latest = Array.from(map.values())
+            .filter((rec) => this.sessionManagerHasMessages(rec.manager))
+            .sort((a, b) => b.updatedAtMs - a.updatedAtMs || b.seq - a.seq)[0];
+          this.sessionManager = latest ? latest.manager : SessionManager.inMemory(this.activeWorkspace);
         } else {
           const sessionDir = this.resolveSessionDir(this.activeWorkspace);
           try {
-            this.sessionManager = SessionManager.continueRecent(this.activeWorkspace, sessionDir);
+            const latestArchived = await this.findLatestArchivedSessionFile(
+              this.activeWorkspace,
+              sessionDir
+            );
+            if (isStale()) return;
+            this.sessionManager = latestArchived
+              ? SessionManager.open(latestArchived, sessionDir, this.activeWorkspace)
+              : SessionManager.create(this.activeWorkspace, sessionDir);
           } catch (err) {
             console.warn(`Failed to resume session in ${sessionDir}, starting fresh:`, err);
             this.sessionManager = SessionManager.create(this.activeWorkspace, sessionDir);
@@ -2465,8 +4594,16 @@ export class AgentService extends EventEmitter {
         }
       }
       this.installSessionRedaction(this.sessionManager);
+      if (!this.isRunningTurn) {
+        this.turnUsageStartEntryIndex = this.sessionManager.getEntries().length;
+        this.inFlightMainStreamText = '';
+        this.lastLiveUsageEmitMs = 0;
+      }
 
       const settingsManager = SettingsManager.inMemory();
+      this.settingsManager = settingsManager;
+      applyPaperCupQueueModes(settingsManager);
+      applyCompactionSettingsForModel(settingsManager, undefined, 'main');
       if (config.bashPath) {
         settingsManager.setShellPath(config.bashPath);
       }
@@ -2476,6 +4613,15 @@ export class AgentService extends EventEmitter {
         agentDir: this.activeWorkspace,
         settingsManager,
         noExtensions: true,
+        extensionFactories: [
+          createPaperCupCompactionExtension({
+            role: 'main',
+            cwd: this.activeWorkspace,
+            getKnownSecrets: () => this.getAllKnownSecrets(),
+            getModel: () => this.currentSession?.model,
+            getStreamFn: () => this.currentSession?.agent?.streamFunction,
+          }),
+        ],
         noSkills: true,
         noPromptTemplates: true,
         noThemes: true,
@@ -2501,12 +4647,18 @@ export class AgentService extends EventEmitter {
       const modelRuntime = await this.getOrCreateModelRuntime();
       if (isStale()) return;
 
+      const researchCfg = readVnResearchConfig(this.activeWorkspace);
+      const skillPaths = this.collectSkillPaths().filter((p) => typeof p === 'string' && p.trim().length > 0);
       const guardedBuiltins = createGuardedBuiltinToolDefinitions(
         this.activeWorkspace,
         ['read', 'bash', 'edit', 'write', 'ls', 'find'],
         {
           bashPath: config.bashPath,
-          getKnownSecrets: () => this.runtimeApiKeys.values(),
+          getKnownSecrets: () => this.getAllKnownSecrets(),
+          ...(skillPaths.length > 0 ? { skillReadRoots: skillPaths } : {}),
+          defaultBashTimeoutSec: researchCfg.mainBashTimeoutSec,
+          maxBashTimeoutSec: Math.max(researchCfg.mainBashTimeoutSec, DEFAULT_MAIN_BASH_MAX_TIMEOUT_SEC),
+          agentRole: 'main',
         }
       );
       const customTools = [...guardedBuiltins, ...vnTools, ...subagentTools];
@@ -2531,6 +4683,8 @@ export class AgentService extends EventEmitter {
       }
 
       this.currentSession = session;
+      applyPaperCupQueueModes(settingsManager, session);
+      this.syncMainCompactionSettings();
       if (this.preferredThinkingLevel && typeof session.setThinkingLevel === 'function') {
         try {
           session.setThinkingLevel(this.preferredThinkingLevel);
@@ -2539,8 +4693,17 @@ export class AgentService extends EventEmitter {
         }
       }
 
-      if (this.runtimeApiKeys.size > 0 && session.modelRuntime?.setRuntimeApiKey) {
-        for (const [providerId, key] of this.runtimeApiKeys) {
+      if (
+        (this.runtimeApiKeys.size > 0 || this.keylessRuntimeProviders.size > 0) &&
+        session.modelRuntime?.setRuntimeApiKey
+      ) {
+        const runtimeEntries: Array<[string, string]> = [
+          ...Array.from(this.runtimeApiKeys.entries()),
+          ...Array.from(this.keylessRuntimeProviders)
+            .filter((pid) => !this.runtimeApiKeys.has(pid))
+            .map((pid): [string, string] => [pid, MAGPIE_KEYLESS_RUNTIME_TOKEN]),
+        ];
+        for (const [providerId, key] of runtimeEntries) {
           const authStatus = session.modelRuntime?.getProviderAuthStatus?.(providerId);
           if (authStatus?.configured && authStatus?.source === 'runtime') {
             continue;
@@ -2560,6 +4723,13 @@ export class AgentService extends EventEmitter {
           if (firstAvailable) {
             try {
               await session.setModel(firstAvailable);
+              if (this.preferredThinkingLevel && typeof session.setThinkingLevel === 'function') {
+                try {
+                  session.setThinkingLevel(this.preferredThinkingLevel);
+                } catch {
+                  // Ignore model clamping edge errors
+                }
+              }
             } catch (err) {
               console.warn('Failed to select restored runtime model:', err);
             }
@@ -2575,6 +4745,13 @@ export class AgentService extends EventEmitter {
         try {
           const preferred = this.resolveModelFromRuntime(this.preferredModelKey);
           await session.setModel(preferred);
+          if (this.preferredThinkingLevel && typeof session.setThinkingLevel === 'function') {
+            try {
+              session.setThinkingLevel(this.preferredThinkingLevel);
+            } catch {
+              // Ignore model clamping edge errors
+            }
+          }
         } catch (err) {
           console.warn(`Failed to restore preferred model ${this.preferredModelKey}:`, err);
           this.preferredModelKey = null;
@@ -2588,14 +4765,23 @@ export class AgentService extends EventEmitter {
       if (
         !session.model &&
         !this.preferredModelKey &&
-        CUSTOM_OPENAI_PROVIDER_LIST.some((spec) =>
-          this.isProviderConfiguredInRuntime(session.modelRuntime, spec.id)
-        )
+        (this.runtimeApiKeys.size > 0 ||
+          this.keylessRuntimeProviders.size > 0 ||
+          CUSTOM_OPENAI_PROVIDER_LIST.some((spec) =>
+            this.isProviderConfiguredInRuntime(session.modelRuntime, spec.id)
+          ))
       ) {
         const firstAvailable = this.pickDefaultProviderModel(this.getAvailableModels(session.modelRuntime));
         if (firstAvailable) {
           try {
             await session.setModel(firstAvailable);
+            if (this.preferredThinkingLevel && typeof session.setThinkingLevel === 'function') {
+              try {
+                session.setThinkingLevel(this.preferredThinkingLevel);
+              } catch {
+                // Ignore model clamping edge errors
+              }
+            }
           } catch (err) {
             console.warn('Failed to select custom provider model:', err);
           }
@@ -2624,11 +4810,18 @@ export class AgentService extends EventEmitter {
           !isModelSupported ||
           (!isModelInAvailable && !this.isProviderConfiguredInRuntime(session.modelRuntime, sessionProvider))
         ) {
-          const fallback = sessionAvailable[0];
+          const fallback = this.pickDefaultProviderModel(sessionAvailable) ?? sessionAvailable[0];
           if (fallback) {
             try {
               await session.setModel(fallback);
               this.preferredModelKey = `${fallback.provider}/${fallback.id}`;
+              if (this.preferredThinkingLevel && typeof session.setThinkingLevel === 'function') {
+                try {
+                  session.setThinkingLevel(this.preferredThinkingLevel);
+                } catch {
+                  // Ignore model clamping edge errors
+                }
+              }
             } catch (err) {
               console.warn('Failed to switch away from cleared provider model:', err);
             }
@@ -2647,6 +4840,8 @@ export class AgentService extends EventEmitter {
         return;
       }
 
+      this.syncMainCompactionSettings();
+
       // セッションイベントをフック
       session.subscribe((event: any) => {
         this.handlePiSessionEvent(event);
@@ -2655,6 +4850,7 @@ export class AgentService extends EventEmitter {
 
       void this.warmProviderApi(session.model?.api);
       this.emitEvent('session_ready', { sessionId: this.sessionManager?.getSessionId?.() });
+      this.emitEvent('token_usage', this.getSessionTokenUsage());
     } catch (err) {
       if (!subscribed) {
         cleanupSession(session);
@@ -2663,7 +4859,78 @@ export class AgentService extends EventEmitter {
     }
   }
 
+  private maybeEmitLiveTokenUsage(): void {
+    const now = Date.now();
+    if (now - this.lastLiveUsageEmitMs < 180) {
+      return;
+    }
+    this.lastLiveUsageEmitMs = now;
+    this.emitEvent('token_usage', this.getSessionTokenUsage());
+  }
+
   private handlePiSessionEvent(event: any): void {
+    if (event.type === 'queue_update') {
+      if (this.isRunningTurn && !this.mainQueueController.isRebuilding) {
+        this.mainQueueController.reconcileWithSession(this.currentSession);
+        this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+      }
+      return;
+    }
+    if (event.type === 'message_start' && event.message?.role === 'user') {
+      if (!this.isRunningTurn) return;
+      this.activeTurnUserMsgCount += 1;
+      if (this.activeTurnUserMsgCount === 1) {
+        return;
+      }
+      const snap = this.activeTurnSnapshot;
+      if (snap && (snap.thinking || snap.response || snap.tools.length > 0)) {
+        const committedAssistant: PersistedChatMessage = {
+          id: `active-a-${++this.activeTurnCommitSeq}`,
+          role: 'assistant',
+          content: snap.response,
+          ...(snap.thinking ? { thinking: snap.thinking } : {}),
+          ...(snap.tools.length > 0 ? { tools: snap.tools.map((t) => ({ ...t })) } : {}),
+          timestamp: new Date().toLocaleTimeString(),
+        };
+        this.activeTurnCommittedMessages.push(committedAssistant);
+        this.emitEvent('turn_segment_commit', { message: committedAssistant });
+        snap.thinking = '';
+        snap.response = '';
+        snap.tools = [];
+      }
+      if (snap) {
+        snap.isThinking = false;
+        snap.phase = 'connecting';
+        snap.retryAttempt = undefined;
+        snap.retryMaxAttempts = undefined;
+      }
+      this.inFlightMainStreamText = '';
+
+      const rawText = this.extractText(event.message?.content);
+      const images = extractImagesFromContent(event.message?.content);
+      const delivered = this.mainQueueController.consumeDelivered(rawText, this.currentSession);
+      const deliveryMode: QueuedMessageMode = delivered?.mode ?? 'steer';
+      const displayText = delivered?.text ?? rawText;
+      const curSessionId = this.sessionManager?.getSessionId?.() ?? null;
+      this.rememberDeliveredUserMode(curSessionId, event.message?.timestamp, rawText, deliveryMode);
+      if (displayText && displayText !== rawText) {
+        this.rememberDeliveredUserMode(curSessionId, event.message?.timestamp, displayText, deliveryMode);
+      }
+      if (displayText.trim() || images.length > 0) {
+        const injectedUser: PersistedChatMessage = {
+          id: delivered?.id || `active-u-${++this.activeTurnCommitSeq}`,
+          role: 'user',
+          content: displayText,
+          ...(images.length > 0 ? { images } : {}),
+          timestamp: this.formatTimestamp(event.message?.timestamp),
+          deliveryMode,
+        };
+        this.activeTurnCommittedMessages.push(injectedUser);
+        this.emitEvent('turn_user_injected', { message: injectedUser });
+      }
+      this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+      return;
+    }
     if (event.type === 'message_update') {
       const update = event.assistantMessageEvent;
       if (!update) return;
@@ -2672,7 +4939,8 @@ export class AgentService extends EventEmitter {
         if (this.turnTiming && this.turnTiming.firstTokenAt === null) {
           this.turnTiming.firstTokenAt = performance.now();
         }
-        const safeDelta = redactSecrets(String(update.delta || ''), this.runtimeApiKeys.values());
+        const safeDelta = redactSecrets(String(update.delta || ''), this.getAllKnownSecrets());
+        this.inFlightMainStreamText += safeDelta;
         if (this.activeTurnSnapshot) {
           this.activeTurnSnapshot.isThinking = false;
           this.activeTurnSnapshot.phase = 'generating';
@@ -2681,11 +4949,13 @@ export class AgentService extends EventEmitter {
           this.activeTurnSnapshot.response += safeDelta;
         }
         this.emitEvent('text_delta', { delta: safeDelta });
+        this.maybeEmitLiveTokenUsage();
       } else if (update.type === 'thinking_delta') {
         if (this.turnTiming && this.turnTiming.firstTokenAt === null) {
           this.turnTiming.firstTokenAt = performance.now();
         }
-        const safeDelta = redactSecrets(String(update.delta || ''), this.runtimeApiKeys.values());
+        const safeDelta = redactSecrets(String(update.delta || ''), this.getAllKnownSecrets());
+        this.inFlightMainStreamText += safeDelta;
         if (this.activeTurnSnapshot) {
           this.activeTurnSnapshot.isThinking = true;
           this.activeTurnSnapshot.phase = 'thinking';
@@ -2694,12 +4964,13 @@ export class AgentService extends EventEmitter {
           this.activeTurnSnapshot.thinking += safeDelta;
         }
         this.emitEvent('thinking_delta', { delta: safeDelta });
+        this.maybeEmitLiveTokenUsage();
       }
     } else if (event.type === 'tool_execution_start') {
       if (this.turnTiming && this.turnTiming.firstTokenAt === null) {
         this.turnTiming.firstTokenAt = performance.now();
       }
-      const safeArgs = redactUnknownValue(event.args, this.runtimeApiKeys.values());
+      const safeArgs = redactUnknownValue(event.args, this.getAllKnownSecrets());
       const callId = typeof event.toolCallId === 'string' && event.toolCallId ? event.toolCallId : undefined;
       const subagentRole =
         event.toolName === 'delegate_task' && typeof safeArgs?.role === 'string'
@@ -2728,7 +4999,7 @@ export class AgentService extends EventEmitter {
         ...(subagentRole ? { subagentRole } : {}),
       });
     } else if (event.type === 'tool_execution_end') {
-      const safeResult = redactUnknownValue(event.result, this.runtimeApiKeys.values());
+      const safeResult = redactUnknownValue(event.result, this.getAllKnownSecrets());
       const callId = typeof event.toolCallId === 'string' && event.toolCallId ? event.toolCallId : undefined;
       const isError = event.isError === true;
       const taskId = typeof safeResult?.details?.taskId === 'string' ? safeResult.details.taskId : undefined;
@@ -2790,29 +5061,717 @@ export class AgentService extends EventEmitter {
         this.activeTurnSnapshot.retryAttempt = undefined;
         this.activeTurnSnapshot.retryMaxAttempts = undefined;
       }
+    } else if (event.type === 'message_end' && event.message?.role === 'user') {
+      if (this.sessionMode === 'memory') {
+        this.commitMemorySessionRecord();
+      }
+      if (this.turnBaseMessageCount === 0) {
+        const curFile = this.sessionManager?.getSessionFile?.();
+        if (curFile) {
+          this.sessionFileMetaCache.delete(
+            process.platform === 'win32' ? curFile.toLowerCase() : curFile
+          );
+        }
+        void this.listWorkspaceSessions()
+          .then((sessions) => {
+            this.emitEvent('sessions_updated', {
+              sessionId: this.sessionManager?.getSessionId?.() ?? null,
+              sessions,
+            });
+          })
+          .catch(() => {
+            // Ignore non-fatal session summary refresh failure
+          });
+      }
     } else if (event.type === 'message_end' && event.message?.role === 'assistant') {
+      this.inFlightMainStreamText = '';
+      this.lastLiveUsageEmitMs = 0;
       if (event.message.stopReason === 'error') {
         const rawErr = String(event.message.errorMessage || '模型请求返回错误。');
         const cls = classifySubagentError(rawErr, false);
         if (cls.fatalForPool && typeof this.currentSession?.setAutoRetryEnabled === 'function') {
           this.currentSession.setAutoRetryEnabled(false);
         }
-        this.lastTurnError = redactSecrets(rawErr, this.runtimeApiKeys.values());
+        this.lastTurnError = redactSecrets(rawErr, this.getAllKnownSecrets());
       } else {
         this.lastTurnError = undefined;
       }
+    } else if (event.type === 'agent_end') {
+      if (this.isRunningTurn && !this.turnAborted && this.lastTurnError && event.willRetry === false) {
+        const hadPending =
+          this.mainQueueController.hasPending() ||
+          ((this.currentSession?.getSteeringMessages?.().length ?? 0) +
+            (this.currentSession?.getFollowUpMessages?.().length ?? 0)) > 0;
+        if (hadPending && !this.activeTurnRestoredDraft) {
+          this.activeTurnRestoredDraft = this.mainQueueController.clearForRestore(this.currentSession);
+          this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+        }
+      }
+    } else if (event.type === 'compaction_start') {
+      this.isCompacting = true;
+      const reason: CompactionReason =
+        this.pendingCompactionReasonOverride ??
+        (event.reason === 'manual' || event.reason === 'overflow' ? event.reason : 'threshold');
+      if (reason === 'overflow') {
+        this.turnOverflowCompactionAttempted = true;
+      }
+      const focus = reason === 'manual' ? this.pendingManualCompactionFocus : undefined;
+      this.emitEvent('compaction_start', {
+        reason,
+        phase: 'compacting',
+        ...(focus ? { focus } : {}),
+      });
+    } else if (event.type === 'compaction_end') {
+      this.isCompacting = false;
+      const reason: CompactionReason =
+        this.pendingCompactionReasonOverride ??
+        (event.reason === 'manual' || event.reason === 'overflow' ? event.reason : 'threshold');
+      const focus = reason === 'manual' ? this.pendingManualCompactionFocus : undefined;
+      const errMsg = typeof event.errorMessage === 'string' ? event.errorMessage : undefined;
+      const isNoop = Boolean(errMsg && /nothing to compact|already compacted|session too small/i.test(errMsg));
+
+      if (event.result) {
+        const branch: any[] = this.sessionManager?.getBranch?.() ?? [];
+        let latestCompactionEntry: any = null;
+        for (let i = branch.length - 1; i >= 0; i -= 1) {
+          if (branch[i]?.type === 'compaction') {
+            latestCompactionEntry = branch[i];
+            break;
+          }
+        }
+        let summaryInfo: CompactionSummaryInfo;
+        if (latestCompactionEntry) {
+          const extracted = extractCompactionSummaryInfo(
+            latestCompactionEntry,
+            event.result.estimatedTokensAfter
+          );
+          const resolvedFocus = extracted.focus ?? focus;
+          summaryInfo = {
+            ...extracted,
+            reason,
+            ...(resolvedFocus ? { focus: resolvedFocus } : {}),
+          };
+        } else {
+          const summary = typeof event.result.summary === 'string' ? event.result.summary : '';
+          const tokensBefore =
+            typeof event.result.tokensBefore === 'number' && Number.isFinite(event.result.tokensBefore)
+              ? Math.max(0, Math.floor(event.result.tokensBefore))
+              : 0;
+          const detailsTokensAfter =
+            typeof event.result.details?.tokensAfter === 'number' &&
+            Number.isFinite(event.result.details.tokensAfter)
+              ? Math.max(0, Math.floor(event.result.details.tokensAfter))
+              : undefined;
+          const tokensAfter =
+            detailsTokensAfter ??
+            (typeof event.result.estimatedTokensAfter === 'number' &&
+            Number.isFinite(event.result.estimatedTokensAfter)
+              ? Math.max(0, Math.floor(event.result.estimatedTokensAfter))
+              : Math.ceil(summary.length / 4));
+          const resolvedFocus =
+            (typeof event.result.details?.focus === 'string' && event.result.details.focus.trim()
+              ? event.result.details.focus.trim()
+              : undefined) ?? focus;
+          const checkpointPath =
+            typeof event.result.details?.checkpointPath === 'string' &&
+            event.result.details.checkpointPath.trim()
+              ? event.result.details.checkpointPath.trim()
+              : undefined;
+          const prunedCount =
+            typeof event.result.details?.prunedCount === 'number' &&
+            Number.isFinite(event.result.details.prunedCount) &&
+            event.result.details.prunedCount > 0
+              ? Math.floor(event.result.details.prunedCount)
+              : undefined;
+          summaryInfo = {
+            id: `compact-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            timestamp: new Date().toISOString(),
+            reason,
+            tokensBefore,
+            tokensAfter,
+            summary,
+            ...(resolvedFocus ? { focus: resolvedFocus } : {}),
+            ...(checkpointPath ? { checkpointPath } : {}),
+            ...(prunedCount !== undefined ? { prunedCount } : {}),
+          };
+        }
+
+        this.lastCompletedCompactionInfo = summaryInfo;
+
+        if (this.isRunningTurn) {
+          const compactionMsg: PersistedChatMessage = {
+            id: summaryInfo.id,
+            role: 'compaction',
+            content: summaryInfo.summary,
+            timestamp: this.formatTimestamp(summaryInfo.timestamp) || summaryInfo.timestamp,
+            compaction: {
+              reason: summaryInfo.reason,
+              tokensBefore: summaryInfo.tokensBefore,
+              tokensAfter: summaryInfo.tokensAfter,
+              ...(summaryInfo.focus ? { focus: summaryInfo.focus } : {}),
+              ...(summaryInfo.checkpointPath ? { checkpointPath: summaryInfo.checkpointPath } : {}),
+            },
+          };
+          if (!this.activeTurnCommittedMessages.some((m) => m.id === compactionMsg.id)) {
+            if (this.activeTurnUserMsgCount === 0) {
+              // Pre-prompt compaction in _prepareRun occurs before the active user message in the branch
+              const firstUserIdx = this.activeTurnCommittedMessages.findIndex((m) => m.id === 'active-user');
+              if (firstUserIdx >= 0) {
+                this.activeTurnCommittedMessages.splice(firstUserIdx, 0, compactionMsg);
+              } else {
+                this.activeTurnCommittedMessages.unshift(compactionMsg);
+              }
+            } else {
+              const snap = this.activeTurnSnapshot;
+              if (snap && (snap.thinking || snap.response || snap.tools.length > 0)) {
+                const committedAssistant: PersistedChatMessage = {
+                  id: `active-a-${++this.activeTurnCommitSeq}`,
+                  role: 'assistant',
+                  content: snap.response,
+                  ...(snap.thinking ? { thinking: snap.thinking } : {}),
+                  ...(snap.tools.length > 0 ? { tools: snap.tools.map((t) => ({ ...t })) } : {}),
+                  timestamp: new Date().toLocaleTimeString(),
+                };
+                this.activeTurnCommittedMessages.push(committedAssistant);
+                this.emitEvent('turn_segment_commit', { message: committedAssistant });
+                snap.thinking = '';
+                snap.response = '';
+                snap.tools = [];
+              }
+              this.activeTurnCommittedMessages.push(compactionMsg);
+            }
+          }
+        }
+
+        this.emitEvent('compaction_end', {
+          reason,
+          status: 'compacted',
+          result: summaryInfo,
+        });
+      } else if (event.aborted || Boolean(errMsg && /compaction cancelled/i.test(errMsg))) {
+        this.emitEvent('compaction_end', {
+          reason,
+          status: 'aborted',
+        });
+      } else if (isNoop) {
+        this.emitEvent('compaction_end', {
+          reason,
+          status: 'noop',
+        });
+      } else {
+        const safeErr = errMsg
+          ? redactSecrets(errMsg, this.getAllKnownSecrets())
+          : '上下文压缩失败。';
+        this.emitEvent('compaction_end', {
+          reason,
+          status: 'error',
+          error: safeErr,
+        });
+      }
+      this.emitEvent('token_usage', this.getSessionTokenUsage());
     }
   }
 
-  async abortTurn(): Promise<boolean> {
+  private normalizeChatImagesOrThrow(rawImages: unknown): ChatImageAttachment[] {
+    try {
+      return validateAndNormalizeImageAttachments(rawImages);
+    } catch (err: any) {
+      throw new AppError(String(err?.message || err || '图片附件校验失败。'), 400);
+    }
+  }
+
+  private assertModelSupportsImages(model: any, images: readonly ChatImageAttachment[]): void {
+    if (images.length > 0 && model && !modelSupportsImageInput(model)) {
+      throw new AppError(
+        `当前模型 ${model.provider}/${model.id} 不支持图片输入，请先切换至支持视觉的模型。`,
+        400,
+        'MODEL_NO_VISION'
+      );
+    }
+  }
+
+  async enqueueMainTurnMessage(
+    prompt: string,
+    mode: QueuedMessageMode,
+    rawImages?: unknown
+  ): Promise<{ item: QueuedMessageItem; queue: PendingQueueState }> {
+    const images = this.normalizeChatImagesOrThrow(rawImages);
+    const trimmed = String(prompt || '').trim();
+    if (!trimmed && images.length === 0) {
+      throw new AppError('消息内容不能为空。', 400);
+    }
     if (!this.isRunningTurn || !this.currentSession) {
-      return false;
+      if (this.activeDirectSubagentTaskId) {
+        throw new AppError(
+          '当前子代理直接对话正在运行，请前往子代理面板插话或停止。',
+          409,
+          'CONFLICT_DIRECT_SUBAGENT'
+        );
+      }
+      throw new AppError('当前没有运行中的主对话，请直接发送消息。', 409, 'TURN_NOT_RUNNING');
+    }
+    this.assertModelSupportsImages(this.currentSession?.model, images);
+    const effectivePrompt = trimmed || DEFAULT_IMAGE_ONLY_PROMPT;
+    const result = await this.mainQueueController.enqueue(this.currentSession, effectivePrompt, mode, images);
+    this.emitEvent('turn_queue_updated', result.queue);
+    return result;
+  }
+
+  async switchMainQueueItemMode(
+    itemId: string,
+    mode: QueuedMessageMode
+  ): Promise<QueueMutationResult> {
+    if (!this.isRunningTurn || !this.currentSession) {
+      throw new AppError('当前没有运行中的主对话。', 409, 'TURN_NOT_RUNNING');
+    }
+    const res = await this.mainQueueController.switchItemMode(this.currentSession, itemId, mode);
+    this.emitEvent('turn_queue_updated', res.queue);
+    return res;
+  }
+
+  async removeMainQueueItem(itemId: string): Promise<QueueMutationResult> {
+    if (!this.isRunningTurn || !this.currentSession) {
+      throw new AppError('当前没有运行中的主对话。', 409, 'TURN_NOT_RUNNING');
+    }
+    const res = await this.mainQueueController.removeItem(this.currentSession, itemId);
+    this.emitEvent('turn_queue_updated', res.queue);
+    return res;
+  }
+
+  async clearMainQueue(): Promise<{
+    cleared: PendingQueueState;
+    restoredDraft: RestoredDraftPayload | null;
+    queue: PendingQueueState;
+  }> {
+    if (!this.isRunningTurn || !this.currentSession) {
+      return {
+        cleared: { steering: [], followUp: [] },
+        restoredDraft: null,
+        queue: { steering: [], followUp: [] },
+      };
+    }
+    const res = await this.mainQueueController.clearAll(this.currentSession);
+    this.emitEvent('turn_queue_updated', res.queue);
+    return res;
+  }
+
+  async enqueueSubagentMessage(
+    taskId: string,
+    message: string,
+    mode: QueuedMessageMode,
+    rawImages?: unknown
+  ): Promise<{ taskId: string; threadId: string; item: QueuedMessageItem; queue: PendingQueueState }> {
+    const images = this.normalizeChatImagesOrThrow(rawImages);
+    const trimmed = String(message || '').trim();
+    if (!trimmed && images.length === 0) {
+      throw new AppError('消息内容不能为空。', 400);
+    }
+    try {
+      return await this.subagentManager.enqueueTaskMessage(
+        this.activeWorkspace,
+        taskId,
+        trimmed || DEFAULT_IMAGE_ONLY_PROMPT,
+        mode,
+        images
+      );
+    } catch (err: any) {
+      if (err?.code === 'MODEL_NO_VISION') {
+        throw new AppError(String(err.message || err), 400, 'MODEL_NO_VISION');
+      }
+      throw err;
+    }
+  }
+
+  async switchSubagentQueueItemMode(
+    taskId: string,
+    itemId: string,
+    mode: QueuedMessageMode
+  ): Promise<QueueMutationResult & { taskId: string; threadId: string }> {
+    return this.subagentManager.switchTaskQueueItemMode(this.activeWorkspace, taskId, itemId, mode);
+  }
+
+  async removeSubagentQueueItem(
+    taskId: string,
+    itemId: string
+  ): Promise<QueueMutationResult & { taskId: string; threadId: string }> {
+    return this.subagentManager.removeTaskQueueItem(this.activeWorkspace, taskId, itemId);
+  }
+
+  async clearSubagentQueue(taskId: string): Promise<{
+    taskId: string;
+    threadId: string;
+    cleared: PendingQueueState;
+    restoredDraft: RestoredDraftPayload | null;
+    queue: PendingQueueState;
+  }> {
+    return this.subagentManager.clearTaskQueue(this.activeWorkspace, taskId);
+  }
+
+  async compactMainSession(focus?: string): Promise<CompactSessionResult> {
+    const cleanFocus = typeof focus === 'string' && focus.trim() ? focus.trim() : undefined;
+    if (this.directSubagentLock || this.activeDirectSubagentTaskId) {
+      throw new AppError(
+        '当前子代理直接对话正在运行，请先等待完成或前往子代理面板执行 /compact。',
+        409,
+        'CONFLICT_DIRECT_SUBAGENT'
+      );
+    }
+
+    if (this.isRunningTurn) {
+      this.queuedMainCompaction = cleanFocus ? { focus: cleanFocus } : {};
+      this.emitEvent('compaction_queued', {
+        queued: true,
+        ...(cleanFocus ? { focus: cleanFocus } : {}),
+      });
+      return {
+        ok: true,
+        status: 'queued',
+        ...(cleanFocus ? { focus: cleanFocus } : {}),
+        message: '已排入队尾，将在当前回合完成后自动执行上下文压缩。',
+      };
+    }
+
+    if (this.turnLock || this.isCompacting) {
+      throw new AppError('当前正在执行会话操作或上下文压缩，请稍后再试。', 409, 'CONFLICT');
+    }
+
+    this.turnLock = true;
+    this.pendingManualCompactionFocus = cleanFocus;
+    this.lastCompletedCompactionInfo = null;
+    try {
+      await this.initSession();
+      if (!this.currentSession?.model) {
+        throw new AppError('当前尚未选择可用模型，无法执行上下文压缩。', 400);
+      }
+      this.syncMainCompactionSettings();
+      const compactRes = await this.currentSession.compact(cleanFocus);
+      const summaryInfo =
+        this.lastCompletedCompactionInfo ??
+        (() => {
+          const branch: any[] = this.sessionManager?.getBranch?.() ?? [];
+          for (let i = branch.length - 1; i >= 0; i -= 1) {
+            if (branch[i]?.type === 'compaction') {
+              const extracted = extractCompactionSummaryInfo(branch[i], compactRes?.estimatedTokensAfter);
+              return {
+                ...extracted,
+                reason: 'manual' as const,
+                ...(extracted.focus || cleanFocus ? { focus: extracted.focus ?? cleanFocus } : {}),
+              };
+            }
+          }
+          const summary = typeof compactRes?.summary === 'string' ? compactRes.summary : '';
+          return {
+            id: `compact-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            timestamp: new Date().toISOString(),
+            reason: 'manual' as const,
+            tokensBefore: typeof compactRes?.tokensBefore === 'number' ? Math.max(0, Math.floor(compactRes.tokensBefore)) : 0,
+            tokensAfter:
+              typeof compactRes?.estimatedTokensAfter === 'number'
+                ? Math.max(0, Math.floor(compactRes.estimatedTokensAfter))
+                : Math.ceil(summary.length / 4),
+            summary,
+            ...(cleanFocus ? { focus: cleanFocus } : {}),
+          };
+        })();
+
+      if (
+        this.sessionMode === 'memory' &&
+        this.sessionManager &&
+        this.sessionManagerHasMessages(this.sessionManager)
+      ) {
+        this.commitMemorySessionRecord();
+      }
+      return {
+        ok: true,
+        status: 'compacted',
+        result: summaryInfo,
+        tokenUsage: this.getSessionTokenUsage(),
+        ...(cleanFocus ? { focus: cleanFocus } : {}),
+      };
+    } catch (err: any) {
+      const msg = String(err?.message || err || '');
+      if (/nothing to compact|already compacted|session too small/i.test(msg)) {
+        return {
+          ok: true,
+          status: 'noop',
+          message: '当前对话较短，暂无可压缩的上下文。',
+          tokenUsage: this.getSessionTokenUsage(),
+        };
+      }
+      if (err instanceof AppError) throw err;
+      throw new AppError(redactSecrets(msg, this.getAllKnownSecrets()), 500);
+    } finally {
+      this.pendingManualCompactionFocus = undefined;
+      this.lastCompletedCompactionInfo = null;
+      this.turnLock = false;
+    }
+  }
+
+  async compactSubagent(taskId: string, focus?: string): Promise<SubagentCompactResult> {
+    try {
+      return await this.subagentManager.compactTask(this.activeWorkspace, taskId, focus);
+    } catch (err: any) {
+      if (err instanceof AppError) throw err;
+      const msg = String(err?.message || err || 'Failed to compact subagent session');
+      if (msg.startsWith('NOT_FOUND:')) {
+        throw new AppError(msg.slice('NOT_FOUND:'.length).trim(), 404, 'NOT_FOUND');
+      }
+      if (msg.startsWith('CONFLICT:')) {
+        throw new AppError(msg.slice('CONFLICT:'.length).trim(), 409, 'CONFLICT');
+      }
+      if (msg.startsWith('BAD_REQUEST:')) {
+        throw new AppError(msg.slice('BAD_REQUEST:'.length).trim(), 400);
+      }
+      throw err;
+    }
+  }
+
+  async abortTurnWithResult(): Promise<{ aborted: boolean; restoredDraft: RestoredDraftPayload | null }> {
+    if (!this.isRunningTurn || !this.currentSession) {
+      if (this.isCompacting && this.currentSession) {
+        this.currentSession.abortCompaction?.();
+        return { aborted: true, restoredDraft: null };
+      }
+      return this.abortDirectSubagentTaskWithResult(undefined, '用户已手动中止子代理对话。');
     }
     this.turnAborted = true;
+    if (this.queuedMainCompaction) {
+      this.queuedMainCompaction = null;
+      this.emitEvent('compaction_queued', { queued: false });
+    }
+    const hadPending =
+      this.mainQueueController.hasPending() ||
+      ((this.currentSession.getSteeringMessages?.().length ?? 0) +
+        (this.currentSession.getFollowUpMessages?.().length ?? 0)) > 0;
+    if (!this.activeTurnRestoredDraft && hadPending) {
+      this.activeTurnRestoredDraft = this.mainQueueController.clearForRestore(this.currentSession);
+    } else {
+      try {
+        this.currentSession.clearQueue?.();
+      } catch {
+        // Ignore queue clear error
+      }
+      this.mainQueueController.reset();
+    }
+    const restoredDraft = this.activeTurnRestoredDraft;
+    if (hadPending || restoredDraft) {
+      this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+    }
     this.activeTurnAbortController?.abort();
     this.subagentManager.abortActiveTasks('主会话已手动中止任务。');
     await this.currentSession.abort();
-    return true;
+    return { aborted: true, restoredDraft };
+  }
+
+  async abortTurn(): Promise<boolean> {
+    const res = await this.abortTurnWithResult();
+    return res.aborted;
+  }
+
+  abortDirectSubagentTaskWithResult(
+    taskId?: string,
+    reason = '用户已手动中止子代理对话。'
+  ): { aborted: boolean; restoredDraft: RestoredDraftPayload | null } {
+    const cleanId = taskId?.trim();
+    if (cleanId) {
+      const subRes = this.subagentManager.abortTaskWithResult(cleanId, reason);
+      let aborted = subRes.aborted;
+      if (this.activeDirectSubagentTaskId === cleanId) {
+        this.activeDirectSubagentAbortController?.abort(reason);
+        aborted = true;
+      }
+      return { aborted, restoredDraft: subRes.restoredDraft };
+    }
+    if (this.activeDirectSubagentTaskId) {
+      const activeId = this.activeDirectSubagentTaskId;
+      const subRes = this.subagentManager.abortTaskWithResult(activeId, reason);
+      this.activeDirectSubagentAbortController?.abort(reason);
+      return { aborted: subRes.aborted || true, restoredDraft: subRes.restoredDraft };
+    }
+    return { aborted: false, restoredDraft: null };
+  }
+
+  abortDirectSubagentTask(taskId?: string, reason = '用户已手动中止子代理对话。'): boolean {
+    return this.abortDirectSubagentTaskWithResult(taskId, reason).aborted;
+  }
+
+  private async syncDirectSubagentSummaryToMain(params: {
+    role: string;
+    taskId: string;
+    threadId: string;
+    priorSessionId: string | null;
+    workspace: string;
+    userMessage: string;
+    status: 'completed' | 'error' | 'aborted';
+    replyPreview: string;
+    artifacts: string[];
+    userSteeredNotes?: SubagentUserSteerNote[];
+    error?: string;
+  }): Promise<void> {
+    if (!this.currentSession?.sendCustomMessage) return;
+    if (this.workspaceKey(this.activeWorkspace) !== this.workspaceKey(params.workspace)) return;
+    const currentSessionId = this.sessionManager?.getSessionId?.() ?? null;
+    if (params.priorSessionId && currentSessionId && params.priorSessionId !== currentSessionId) {
+      return;
+    }
+    const secrets = this.getAllKnownSecrets();
+    const compactText = (raw: string, cap: number) => {
+      const cleaned = redactSecrets(String(raw || '').replace(/\s+/g, ' ').trim(), secrets);
+      return cleaned.length <= cap ? cleaned : `${cleaned.slice(0, cap)}…`;
+    };
+    const lines = [
+      '[子代理直接对话同步 / Direct Subagent Sync]',
+      `role=${params.role} threadId=${params.threadId} taskId=${params.taskId} status=${params.status}`,
+      `用户直接提问: ${compactText(params.userMessage, 320)}`,
+    ];
+    if (params.userSteeredNotes && params.userSteeredNotes.length > 0) {
+      const steerNotesText = params.userSteeredNotes
+        .slice(-4)
+        .map((n) => `${n.mode === 'steer' ? '插话' : '排队'}: ${compactText(n.text, 120)}`)
+        .join(' | ');
+      lines.push(`运行中追加指令(${params.userSteeredNotes.length}): ${compactText(steerNotesText, 320)}`);
+    }
+    if (params.replyPreview.trim()) {
+      lines.push(`子代理回复摘要: ${compactText(params.replyPreview, 800)}`);
+    }
+    if (params.artifacts.length > 0) {
+      lines.push(`相关产物: ${params.artifacts.slice(-8).join(', ')}`);
+    }
+    if (params.error) {
+      lines.push(`状态说明: ${compactText(params.error, 260)}`);
+    }
+    const summaryText = compactText(lines.join('\n'), 1600);
+    try {
+      await this.currentSession.sendCustomMessage(
+        {
+          customType: 'papercup_subagent_direct_sync',
+          content: summaryText,
+          display: false,
+          details: {
+            role: params.role,
+            taskId: params.taskId,
+            threadId: params.threadId,
+            status: params.status,
+            ...(params.userSteeredNotes && params.userSteeredNotes.length > 0
+              ? { userSteerCount: params.userSteeredNotes.length }
+              : {}),
+          },
+        },
+        { triggerTurn: false }
+      );
+    } catch {
+      // Non-fatal: direct subagent turn completed even if main session sync injection fails
+    }
+  }
+
+  async startDirectSubagentMessage(
+    taskId: string,
+    message: string,
+    rawImages?: unknown
+  ): Promise<{ taskId: string; threadId: string; status: 'started' }> {
+    if (this.isBusy()) {
+      throw new AppError('当前主对话或子代理正在运行，请等待完成或先中止后再发送。', 409, 'CONFLICT');
+    }
+    const images = this.normalizeChatImagesOrThrow(rawImages);
+    const trimmedMessage = String(message || '').trim();
+    if (!trimmedMessage && images.length === 0) {
+      throw new AppError('消息内容不能为空。', 400);
+    }
+    const effectiveMessage = trimmedMessage || DEFAULT_IMAGE_ONLY_PROMPT;
+    const cleanTaskId = taskId.trim();
+    const priorSnap = this.subagentManager.getTask(this.activeWorkspace, cleanTaskId);
+    if (!priorSnap) {
+      throw new AppError(`未找到子代理任务 ${cleanTaskId}`, 404, 'NOT_FOUND');
+    }
+    if (priorSnap.role === 'translator') {
+      throw new AppError('translator 为批量译文工作角色，不支持直接聊天交互。', 400);
+    }
+
+    const cwd = this.activeWorkspace;
+    this.directSubagentLock = true;
+    try {
+      await this.initSession();
+      if (this.isRunningTurn || this.turnLock || this.activeDirectSubagentTaskId) {
+        throw new AppError('当前主对话或子代理正在运行，请等待完成或先中止后再发送。', 409, 'CONFLICT');
+      }
+      if (this.workspaceKey(this.activeWorkspace) !== this.workspaceKey(cwd)) {
+        throw new AppError('工作区已切换，请重新打开子代理会话。', 409, 'CONFLICT');
+      }
+      this.assertModelSupportsImages(this.currentSession?.model, images);
+
+      const safeRoleSlug = priorSnap.role.replace(/[^A-Za-z0-9_-]+/g, '_') || 'subagent';
+      const nextTaskId = `subtask-${safeRoleSlug}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const threadId = priorSnap.threadId || priorSnap.taskId;
+      const sessionId = this.sessionManager?.getSessionId?.() ?? priorSnap.sessionId ?? null;
+      const controller = new AbortController();
+
+      this.activeDirectSubagentTaskId = nextTaskId;
+      this.activeDirectSubagentAbortController = controller;
+      this.emitEvent('sync_state', this.getTurnSyncState());
+
+      void (async () => {
+        try {
+          const result = await this.subagentManager.runSubagentWithMetrics(priorSnap.role, effectiveMessage, {
+            cwd,
+            signal: controller.signal,
+            model: this.currentSession?.model,
+            modelRuntime: this.currentSession?.modelRuntime,
+            getKnownSecrets: () => this.getAllKnownSecrets(),
+            sessionId,
+            taskId: nextTaskId,
+            resumeTaskId: priorSnap.taskId,
+            origin: 'direct_user',
+            ...(images.length > 0 ? { images } : {}),
+            recordDiagnostics: this.sessionMode === 'persist',
+            onStreamDelta: (ev) => this.emitEvent('subagent_stream_delta', ev),
+          });
+          await this.syncDirectSubagentSummaryToMain({
+            role: priorSnap.role,
+            taskId: result.taskId,
+            threadId: result.snapshot.threadId || threadId,
+            priorSessionId: sessionId,
+            workspace: cwd,
+            userMessage: effectiveMessage,
+            status: 'completed',
+            replyPreview: result.text || result.snapshot.responsePreview || '',
+            artifacts: result.snapshot.artifacts ?? [],
+            userSteeredNotes: result.userSteeredNotes,
+          });
+        } catch (err: any) {
+          const errSnap = (err?.snapshot as SubagentTaskSnapshot | undefined) ?? this.subagentManager.getTask(cwd, nextTaskId);
+          const errStatus: 'error' | 'aborted' = err?.metrics?.status === 'aborted' || errSnap?.status === 'aborted' ? 'aborted' : 'error';
+          await this.syncDirectSubagentSummaryToMain({
+            role: priorSnap.role,
+            taskId: nextTaskId,
+            threadId: errSnap?.threadId || threadId,
+            priorSessionId: sessionId,
+            workspace: cwd,
+            userMessage: effectiveMessage,
+            status: errStatus,
+            replyPreview: errSnap?.responsePreview || '',
+            artifacts: errSnap?.artifacts ?? [],
+            userSteeredNotes: Array.isArray(err?.userSteeredNotes) ? err.userSteeredNotes : undefined,
+            error: String(err?.message || errSnap?.error || err),
+          });
+        } finally {
+          if (this.activeDirectSubagentTaskId === nextTaskId) {
+            this.activeDirectSubagentTaskId = null;
+            this.activeDirectSubagentAbortController = null;
+          }
+          this.invalidateEngineeringStatusCache(cwd);
+          this.emitEvent('token_usage', this.getSessionTokenUsage());
+          this.emitEvent('sync_state', this.getTurnSyncState());
+        }
+      })();
+
+      return {
+        taskId: nextTaskId,
+        threadId,
+        status: 'started',
+      };
+    } finally {
+      this.directSubagentLock = false;
+    }
   }
 
   private detectInterruptedTurnTail(rawMessages: readonly any[]): { tailStartMs: number; tailSignature: string } | null {
@@ -2895,7 +5854,7 @@ export class AgentService extends EventEmitter {
       for (const task of recentFailed) {
         const detail = this.subagentManager.getTask(this.activeWorkspace, task.taskId);
         const artifacts = (detail?.artifacts ?? []).slice(0, 6);
-        const reason = redactSecrets(String(task.error || task.status), this.runtimeApiKeys.values()).slice(0, 140);
+        const reason = redactSecrets(String(task.error || task.status), this.getAllKnownSecrets()).slice(0, 140);
         const parts = [
           `subagent=${task.role}`,
           `status=${task.status}`,
@@ -2910,7 +5869,7 @@ export class AgentService extends EventEmitter {
       }
     }
 
-    const postQaDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'post_qa_report.json'));
+    const postQaDoc = this.readWorkspaceJson(WORKSPACE_POST_QA_REPORT_REL);
     if (
       postQaDoc &&
       (postQaDoc.interrupted ||
@@ -2923,11 +5882,11 @@ export class AgentService extends EventEmitter {
       const errs = Number(postQaDoc.roleCheckerErrors || 0);
       const kind = postQaDoc.interruptKind ? ` kind=${postQaDoc.interruptKind}` : '';
       lines.push(
-        `- post_qa: status=${postQaDoc.interrupted ? 'interrupted' : 'partial'}${kind} reviewed=${reviewed}/${total} pending=${pending} errors=${errs} state=.papercup/vn/post_qa_state.json -> 直接调用 vn_post_qa_parallel 续检剩余分片，严禁传 skipRoleChecker=true 或手动替代 role-checker`
+        `- post_qa: status=${postQaDoc.interrupted ? 'interrupted' : 'partial'}${kind} reviewed=${reviewed}/${total} pending=${pending} errors=${errs} state=${WORKSPACE_POST_QA_STATE_REL} -> 直接调用 vn_post_qa_parallel 续检剩余分片，严禁传 skipRoleChecker=true 或手动替代 role-checker`
       );
     }
 
-    const progressDoc = this.readWorkspaceJson(path.join('.papercup', 'vn', 'progress.json'));
+    const progressDoc = this.readWorkspaceJson(WORKSPACE_PROGRESS_REL);
     const summary = progressDoc?.summary;
     const totalBatches = Number(summary?.total_batches || 0);
     const pendingBatches = Number(summary?.pending_batches || 0);
@@ -2966,70 +5925,275 @@ export class AgentService extends EventEmitter {
     );
   }
 
-  async executeTurn(prompt: string, options?: { model?: string }): Promise<void> {
-    if (this.isRunningTurn) {
-      throw new Error('A turn is already in progress.');
+  /**
+   * 同步上锁并完成前置选模校验后在后台启动主回合（供 POST /api/turns/start 使用，彻底消除异步 TOCTOU 窗口，
+   * 同时保留无效 model 参数同步返回 400 的 HTTP 契约）。
+   */
+  async startTurn(prompt: string, options?: { model?: string; images?: unknown }): Promise<void> {
+    if (this.isRunningTurn || this.turnLock) {
+      throw new AppError('A turn is already in progress.', 409);
     }
-
-    const turnStartedAt = performance.now();
-    await this.initSession();
-    if (typeof this.currentSession?.setAutoRetryEnabled === 'function') {
-      this.currentSession.setAutoRetryEnabled(true);
+    if (this.directSubagentLock || this.activeDirectSubagentTaskId) {
+      throw new AppError('A direct subagent conversation turn is already in progress.', 409);
     }
-    if (this.pendingSkillReload && this.currentSession?.reload) {
-      await this.currentSession.reload();
-      this.pendingSkillReload = false;
+    const normalizedImages = this.normalizeChatImagesOrThrow(options?.images);
+    const rawPrompt = typeof prompt === 'string' ? prompt : '';
+    if (!rawPrompt.trim() && normalizedImages.length === 0) {
+      throw new AppError('Missing prompt', 400);
     }
+    const effectivePrompt = rawPrompt.trim() ? rawPrompt : DEFAULT_IMAGE_ONLY_PROMPT;
+    this.turnLock = true;
     const requestedModel = options?.model?.trim();
-    if (requestedModel && !this.isSameModelRef(this.currentSession?.model, requestedModel)) {
-      await this.selectModel(requestedModel);
+    try {
+      await this.initSession();
+      if (requestedModel && !this.isSameModelRef(this.currentSession?.model, requestedModel)) {
+        await this.selectModelInternal(requestedModel);
+      }
+      this.assertModelSupportsImages(this.currentSession?.model, normalizedImages);
+    } catch (err) {
+      this.turnLock = false;
+      throw err;
     }
 
-    const rawBefore = this.sessionManager?.buildSessionContext?.().messages ?? [];
-    await this.injectInterruptionRecoveryIfNeeded(rawBefore);
-    this.turnBaseMessageCount = this.projectMessages(rawBefore, {
-      markUnresolvedToolsInterrupted: true,
-    }).length;
-    this.activeTurnAbortController = new AbortController();
-    this.activeTurnPrompt = prompt;
-    this.activeTurnStartedAtLabel = new Date().toLocaleTimeString();
+    this.runLockedTurn(effectivePrompt, {
+      model: requestedModel,
+      images: normalizedImages,
+      modelPrevalidated: true,
+    }).catch((err) => {
+      console.error('Turn execution error:', err);
+    });
+  }
 
-    const activeModel = this.currentSession?.model;
-    const activeModelKey = activeModel ? `${activeModel.provider}/${activeModel.id}` : requestedModel;
-    this.activeTurnSnapshot = {
-      sessionId: this.sessionManager?.getSessionId?.() ?? null,
-      model: activeModelKey || null,
-      isThinking: false,
-      phase: 'connecting',
-      thinking: '',
-      response: '',
-      tools: [],
-      startedAt: new Date().toISOString(),
-    };
+  async executeTurn(prompt: string, options?: { model?: string; images?: unknown }): Promise<void> {
+    if (this.isRunningTurn || this.turnLock) {
+      throw new AppError('A turn is already in progress.', 409);
+    }
+    if (this.directSubagentLock || this.activeDirectSubagentTaskId) {
+      throw new AppError('A direct subagent conversation turn is already in progress.', 409);
+    }
+    const normalizedImages = this.normalizeChatImagesOrThrow(options?.images);
+    const rawPrompt = typeof prompt === 'string' ? prompt : '';
+    if (!rawPrompt.trim() && normalizedImages.length === 0) {
+      throw new AppError('Missing prompt', 400);
+    }
+    const effectivePrompt = rawPrompt.trim() ? rawPrompt : DEFAULT_IMAGE_ONLY_PROMPT;
+    this.turnLock = true;
+    return this.runLockedTurn(effectivePrompt, {
+      model: options?.model?.trim(),
+      images: normalizedImages,
+      modelPrevalidated: false,
+    });
+  }
 
-    this.isRunningTurn = true;
-    this.turnAborted = false;
-    this.lastTurnError = undefined;
-
-    this.emitEvent('turn_started', { prompt, model: activeModelKey });
-
-    const promptCalledAt = performance.now();
-    this.turnTiming = {
-      startedAt: turnStartedAt,
-      promptCalledAt,
-      firstTokenAt: null,
-      retries: 0,
-      modelKey: activeModelKey || 'unknown',
-    };
-
+  private async runLockedTurn(
+    prompt: string,
+    options: { model?: string; images?: ChatImageAttachment[]; modelPrevalidated?: boolean }
+  ): Promise<void> {
+    const turnStartedAt = performance.now();
+    const requestedModel = options.model?.trim();
+    const normalizedImages = Array.isArray(options.images) ? options.images : [];
     try {
-      await this.currentSession.prompt(prompt);
+      await this.initSession();
+      if (typeof this.currentSession?.setAutoRetryEnabled === 'function') {
+        this.currentSession.setAutoRetryEnabled(true);
+      }
+      if (this.pendingSkillReload && this.currentSession?.reload) {
+        await this.currentSession.reload();
+        this.pendingSkillReload = false;
+      }
+      if (
+        !options.modelPrevalidated &&
+        requestedModel &&
+        !this.isSameModelRef(this.currentSession?.model, requestedModel)
+      ) {
+        await this.selectModelInternal(requestedModel);
+      }
+      if (!options.modelPrevalidated) {
+        this.assertModelSupportsImages(this.currentSession?.model, normalizedImages);
+      }
+
+      const branchBefore = this.sessionManager?.getBranch?.();
+      const rawBefore = this.sessionManager?.buildSessionContext?.().messages ?? [];
+      await this.injectInterruptionRecoveryIfNeeded(rawBefore);
+      this.turnBaseMessageCount = Array.isArray(branchBefore)
+        ? this.projectMessages(branchBefore, {
+            markUnresolvedToolsInterrupted: true,
+            sessionId: this.sessionManager?.getSessionId?.() ?? null,
+            sessionEntries: this.sessionManager?.getEntries?.() ?? [],
+            fromBranchEntries: true,
+          }).length
+        : this.projectMessages(rawBefore, {
+            markUnresolvedToolsInterrupted: true,
+            sessionId: this.sessionManager?.getSessionId?.() ?? null,
+            sessionEntries: this.sessionManager?.getEntries?.() ?? [],
+          }).length;
+      this.activeTurnAbortController = new AbortController();
+      this.activeTurnPrompt = prompt;
+      this.activeTurnImages = normalizedImages.map((img) => ({ ...img }));
+      this.activeTurnStartedAtLabel = new Date().toLocaleTimeString();
+      this.mainQueueController.reset();
+      try {
+        this.currentSession?.clearQueue?.();
+      } catch {
+        // Ignore pre-turn queue cleanup error
+      }
+      applyPaperCupQueueModes(undefined, this.currentSession);
+      this.activeTurnCommittedMessages = [
+        {
+          id: 'active-user',
+          role: 'user',
+          content: prompt,
+          ...(this.activeTurnImages.length > 0
+            ? { images: this.activeTurnImages.map((img) => ({ ...img })) }
+            : {}),
+          timestamp: this.activeTurnStartedAtLabel,
+        },
+      ];
+      this.activeTurnUserMsgCount = 0;
+      this.activeTurnCommitSeq = 0;
+      this.activeTurnRestoredDraft = null;
+
+      const activeModel = this.currentSession?.model;
+      const activeModelKey = activeModel ? `${activeModel.provider}/${activeModel.id}` : requestedModel;
+      this.activeTurnSnapshot = {
+        sessionId: this.sessionManager?.getSessionId?.() ?? null,
+        model: activeModelKey || null,
+        isThinking: false,
+        phase: 'connecting',
+        thinking: '',
+        response: '',
+        tools: [],
+        startedAt: new Date().toISOString(),
+      };
+
+      this.isRunningTurn = true;
+      this.turnAborted = false;
+      this.lastTurnError = undefined;
+      this.turnOverflowCompactionAttempted = false;
+      this.turnUsageStartEntryIndex = this.sessionManager?.getEntries?.().length ?? 0;
+      this.inFlightMainStreamText = '';
+      this.lastLiveUsageEmitMs = 0;
+
+      this.emitEvent('token_usage', this.getSessionTokenUsage());
+      this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+      this.emitEvent('turn_started', {
+        prompt,
+        model: activeModelKey,
+        ...(normalizedImages.length > 0 ? { imageCount: normalizedImages.length } : {}),
+      });
+
+      const promptCalledAt = performance.now();
+      this.turnTiming = {
+        startedAt: turnStartedAt,
+        promptCalledAt,
+        firstTokenAt: null,
+        retries: 0,
+        modelKey: activeModelKey || 'unknown',
+      };
+    } catch (preflightErr) {
+      this.turnLock = false;
+      this.isRunningTurn = false;
+      this.activeTurnAbortController = null;
+      this.activeTurnSnapshot = null;
+      this.activeTurnImages = [];
+      throw preflightErr;
+    }
+
+    let turnErrored = false;
+    try {
+      await this.currentSession.prompt(
+        prompt,
+        normalizedImages.length > 0 ? { images: toPiImageContents(normalizedImages) } : undefined
+      );
+
+      // Bounded single-shot overflow recovery for Chinese / custom-gateway overflow messages
+      // that Pi SDK's built-in isContextOverflow did not recognize.
+      if (
+        !this.turnAborted &&
+        this.lastTurnError &&
+        isPaperCupContextOverflow(this.lastTurnError) &&
+        !this.turnOverflowCompactionAttempted
+      ) {
+        this.turnOverflowCompactionAttempted = true;
+        const branchEntries: any[] = this.sessionManager?.getBranch?.() ?? [];
+        let failedAssistantEntryId: string | null = null;
+        for (let i = branchEntries.length - 1; i >= 0; i -= 1) {
+          const ent = branchEntries[i];
+          if (ent?.type === 'message' && ent.message?.role === 'assistant' && ent.message?.stopReason === 'error') {
+            failedAssistantEntryId = ent.id;
+            break;
+          }
+        }
+        if (failedAssistantEntryId && typeof this.sessionManager?.appendContextEdit === 'function') {
+          try {
+            this.sessionManager.appendContextEdit(failedAssistantEntryId, null);
+            this.currentSession?.refreshContext?.();
+          } catch {
+            // Best-effort omission before overflow compaction
+          }
+        }
+        let recoveredViaCompact = false;
+        this.pendingCompactionReasonOverride = 'overflow';
+        try {
+          await this.currentSession.compact();
+          recoveredViaCompact = true;
+        } catch {
+          // If compaction cannot run (e.g. session too small or provider error), keep original error.
+        } finally {
+          this.pendingCompactionReasonOverride = undefined;
+        }
+        if (recoveredViaCompact && !this.turnAborted) {
+          this.lastTurnError = undefined;
+          if (this.activeTurnSnapshot) {
+            this.activeTurnSnapshot.phase = 'connecting';
+            this.activeTurnSnapshot.isThinking = false;
+            this.activeTurnSnapshot.thinking = '';
+            this.activeTurnSnapshot.response = '';
+          }
+          const curMsgs: any[] = this.currentSession?.messages ?? this.currentSession?.agent?.state?.messages ?? [];
+          const tailMsg = curMsgs[curMsgs.length - 1];
+          if (typeof this.currentSession?.agent?.continue === 'function' && tailMsg?.role !== 'assistant') {
+            await this.currentSession.agent.continue();
+          } else {
+            await this.currentSession.prompt('请基于上述压缩后的上下文继续完成刚才未完成的任务。');
+          }
+        }
+      }
+
       if (!this.turnAborted && this.lastTurnError) {
-        this.emitEvent('turn_error', { message: this.lastTurnError });
+        turnErrored = true;
+        if (!this.activeTurnRestoredDraft) {
+          this.activeTurnRestoredDraft = this.mainQueueController.clearForRestore(this.currentSession);
+        }
+        this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+        this.emitEvent('turn_error', {
+          message: this.lastTurnError,
+          ...(this.activeTurnRestoredDraft ? { restoredDraft: this.activeTurnRestoredDraft } : {}),
+        });
+      } else if (!this.turnAborted && !this.lastTurnError && this.queuedMainCompaction) {
+        const queued = this.queuedMainCompaction;
+        this.queuedMainCompaction = null;
+        this.emitEvent('compaction_queued', { queued: false });
+        this.pendingManualCompactionFocus = queued.focus;
+        try {
+          await this.currentSession.compact(queued.focus);
+        } catch {
+          // Non-fatal: noop or failed post-turn compaction is already reported via compaction_end SSE
+        } finally {
+          this.pendingManualCompactionFocus = undefined;
+        }
       }
     } catch (error: any) {
-      const safeErrorMsg = redactSecrets(String(error?.message || error), this.runtimeApiKeys.values());
-      this.emitEvent('turn_error', { message: safeErrorMsg });
+      turnErrored = true;
+      if (!this.activeTurnRestoredDraft) {
+        this.activeTurnRestoredDraft = this.mainQueueController.clearForRestore(this.currentSession);
+      }
+      this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+      const safeErrorMsg = redactSecrets(String(error?.message || error), this.getAllKnownSecrets());
+      this.emitEvent('turn_error', {
+        message: safeErrorMsg,
+        ...(this.activeTurnRestoredDraft ? { restoredDraft: this.activeTurnRestoredDraft } : {}),
+      });
       throw error;
     } finally {
       const finishedAt = performance.now();
@@ -3046,23 +6210,58 @@ export class AgentService extends EventEmitter {
       }
 
       const status = this.turnAborted ? 'aborted' : 'completed';
+      const hadResidualQueue =
+        this.mainQueueController.hasPending() ||
+        ((this.currentSession?.getSteeringMessages?.().length ?? 0) +
+          (this.currentSession?.getFollowUpMessages?.().length ?? 0)) > 0;
+      if ((this.turnAborted || turnErrored) && !this.activeTurnRestoredDraft && hadResidualQueue) {
+        this.activeTurnRestoredDraft = this.mainQueueController.clearForRestore(this.currentSession);
+      } else {
+        try {
+          this.currentSession?.clearQueue?.();
+        } catch {
+          // Ignore post-turn queue cleanup error
+        }
+        this.mainQueueController.reset();
+      }
+      const restoredDraftForFinish = this.activeTurnRestoredDraft;
+      if (this.queuedMainCompaction) {
+        this.queuedMainCompaction = null;
+        this.emitEvent('compaction_queued', { queued: false });
+      }
       this.isRunningTurn = false;
+      this.turnLock = false;
       this.turnAborted = false;
       this.lastTurnError = undefined;
+      this.turnOverflowCompactionAttempted = false;
       this.activeTurnAbortController = null;
       this.activeTurnSnapshot = null;
       this.activeTurnPrompt = '';
+      this.activeTurnImages = [];
       this.activeTurnStartedAtLabel = '';
       this.turnBaseMessageCount = 0;
+      this.activeTurnCommittedMessages = [];
+      this.activeTurnUserMsgCount = 0;
+      this.activeTurnCommitSeq = 0;
+      this.activeTurnRestoredDraft = null;
+      this.inFlightMainStreamText = '';
+      this.lastLiveUsageEmitMs = 0;
       this.invalidateEngineeringStatusCache();
-      if (this.sessionMode === 'memory' && this.sessionManager) {
-        const rec = this.getWorkspaceMemoryMap().get(this.sessionManager.getSessionId());
-        if (rec) {
-          rec.updatedAtMs = Date.now();
-          rec.seq = ++this.memorySeq;
-        }
+      if (
+        this.sessionMode === 'memory' &&
+        this.sessionManager &&
+        this.sessionManagerHasMessages(this.sessionManager)
+      ) {
+        this.commitMemorySessionRecord();
       }
-      this.emitEvent('turn_finished', { status });
+      if (hadResidualQueue || restoredDraftForFinish) {
+        this.emitEvent('turn_queue_updated', this.mainQueueController.getState());
+      }
+      this.emitEvent('token_usage', this.getSessionTokenUsage());
+      this.emitEvent('turn_finished', {
+        status,
+        ...(restoredDraftForFinish ? { restoredDraft: restoredDraftForFinish } : {}),
+      });
       try {
         const sessions = await this.listWorkspaceSessions();
         this.emitEvent('sessions_updated', {

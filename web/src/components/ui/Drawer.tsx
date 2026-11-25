@@ -51,14 +51,24 @@ export function Drawer({ isOpen, onClose, side, ariaLabel, id, children }: Drawe
     }
     phaseRef.current = 'closing';
     const closedLeft = side === 'start' ? sheet.offsetWidth : 0;
+
+    const handleCloseScrollEnd = () => {
+      if (phaseRef.current === 'closing' && Math.abs(scroller.scrollLeft - closedLeft) <= 2) {
+        finalizeClosed();
+      }
+    };
+    if ('onscrollend' in window) {
+      scroller.addEventListener('scrollend', handleCloseScrollEnd, { once: true });
+    }
     scroller.scrollTo({ left: closedLeft, behavior: 'auto' });
 
     clearFallbackTimer();
     closeFallbackTimerRef.current = window.setTimeout(() => {
+      scroller.removeEventListener('scrollend', handleCloseScrollEnd);
       if (phaseRef.current === 'closing' && dialog.open) {
         finalizeClosed();
       }
-    }, 520);
+    }, 650);
   }, [finalizeClosed, side]);
 
   // IntersectionObserver monitors sheet visibility inside the dialog viewport
@@ -119,6 +129,7 @@ export function Drawer({ isOpen, onClose, side, ariaLabel, id, children }: Drawe
     if (!dialog || !scroller || !sheet) return;
 
     let cancelled = false;
+    let openScrollEndCleanup: (() => void) | null = null;
 
     if (isOpen) {
       clearFallbackTimer();
@@ -140,14 +151,27 @@ export function Drawer({ isOpen, onClose, side, ariaLabel, id, children }: Drawe
           });
         }
         if (cancelled || !dialog.open) return;
+
+        const markOpenIfSettled = () => {
+          if (cancelled || !dialog.open || phaseRef.current !== 'opening') return;
+          if (Math.abs(scroller.scrollLeft - openLeft) <= 2) {
+            phaseRef.current = 'open';
+          }
+        };
+
+        if ('onscrollend' in window) {
+          scroller.addEventListener('scrollend', markOpenIfSettled, { once: true });
+          openScrollEndCleanup = () => scroller.removeEventListener('scrollend', markOpenIfSettled);
+        }
+
         scroller.scrollTo({ left: openLeft, behavior: 'auto' });
         const target = sheet.querySelector<HTMLElement>('[data-autofocus]');
         target?.focus({ preventScroll: true });
-        window.setTimeout(() => {
-          if (!cancelled && phaseRef.current === 'opening') {
-            phaseRef.current = 'open';
-          }
-        }, 420);
+
+        // Instant scroll (e.g., prefers-reduced-motion) may already be at openLeft on next frame
+        requestAnimationFrame(() => {
+          markOpenIfSettled();
+        });
       };
 
       void startOpenScroll();
@@ -157,6 +181,7 @@ export function Drawer({ isOpen, onClose, side, ariaLabel, id, children }: Drawe
 
     return () => {
       cancelled = true;
+      openScrollEndCleanup?.();
     };
   }, [isOpen, requestAnimatedClose, side]);
 

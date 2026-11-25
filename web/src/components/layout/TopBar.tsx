@@ -8,7 +8,6 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   PanelRight,
-  Search,
   Sun,
 } from 'lucide-react';
 import { ResolvedColorScheme } from '@/hooks/useColorScheme.js';
@@ -24,7 +23,6 @@ interface TopBarProps {
   sessions: SessionSummary[];
   activeSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
-  onOpenCommandPalette: () => void;
   resolvedScheme: ResolvedColorScheme;
   onToggleQuickScheme: (origin?: { x: number; y: number }) => void;
   isStreaming: boolean;
@@ -41,9 +39,6 @@ interface TopBarProps {
   engineeringDrawerId: string;
 }
 
-const isMacLike = () =>
-  typeof navigator !== 'undefined' && /mac|iphone|ipad|ipod/i.test(navigator.platform || '');
-
 export function TopBar({
   activeWorkspace,
   engineLabel,
@@ -51,7 +46,6 @@ export function TopBar({
   sessions,
   activeSessionId,
   onSelectSession,
-  onOpenCommandPalette,
   resolvedScheme,
   onToggleQuickScheme,
   isStreaming,
@@ -141,44 +135,39 @@ export function TopBar({
       </div>
 
       <div className="flex flex-wrap items-center gap-1.5">
-        {(!isDesktopSidebar || !isSidebarVisible) && sessions.length > 1 && (
-          <div className="flex min-w-0 items-center gap-1 rounded-full border border-line bg-surface-raised px-2 py-0.5 text-xs text-ink-2">
-            <MessageSquare className="size-3.5 shrink-0 text-string" aria-hidden="true" />
-            <label htmlFor={sessionSelectId} className="visually-hidden">
-              切换对话会话
-            </label>
-            <select
-              id={sessionSelectId}
-              name="session"
-              value={activeSessionId || sessions[0]?.id || ''}
-              disabled={isStreaming}
-              onChange={(e) => {
-                if (e.target.value) onSelectSession(e.target.value);
-              }}
-              aria-label="切换对话会话"
-              className="pc-select max-w-[26vw] truncate rounded py-0.5 pr-1 text-xs font-medium text-ink disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
-            >
-              {sessions.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.title}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        <button
-          type="button"
-          onClick={onOpenCommandPalette}
-          aria-haspopup="dialog"
-          aria-label="打开命令面板"
-          title="命令面板 (Ctrl+K)"
-          className="inline-flex h-8 items-center gap-2 rounded-full border border-line bg-surface-raised px-2.5 text-xs text-ink-2 transition-colors hover:border-line-strong hover:text-ink cursor-pointer"
-        >
-          <Search className="size-3.5 text-ink-3" aria-hidden="true" />
-          <span className="hidden md:inline">命令与检索</span>
-          <kbd className="pc-kbd hidden sm:inline-flex">{isMacLike() ? '⌘K' : 'Ctrl K'}</kbd>
-        </button>
+        {(!isDesktopSidebar || !isSidebarVisible) && sessions.length > 0 && (() => {
+          const isArchivedActive = Boolean(activeSessionId && sessions.some((s) => s.id === activeSessionId));
+          return (
+            <div className="flex min-w-0 items-center gap-1 rounded-full border border-line bg-surface-raised px-2 py-0.5 text-xs text-ink-2">
+              <MessageSquare className="size-3.5 shrink-0 text-string" aria-hidden="true" />
+              <label htmlFor={sessionSelectId} className="visually-hidden">
+                切换对话会话
+              </label>
+              <select
+                id={sessionSelectId}
+                name="session"
+                value={isArchivedActive ? (activeSessionId ?? '') : ''}
+                disabled={isStreaming}
+                onChange={(e) => {
+                  if (e.target.value) onSelectSession(e.target.value);
+                }}
+                aria-label="切换对话会话"
+                className="pc-select max-w-[26vw] truncate rounded py-0.5 pr-1 text-xs font-medium text-ink disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
+              >
+                {!isArchivedActive && (
+                  <option value="" disabled>
+                    新对话（未留档）
+                  </option>
+                )}
+                {sessions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+          );
+        })()}
 
         <div
           role="status"
@@ -225,7 +214,7 @@ export function TopBar({
           aria-expanded={!isDesktopEngineering ? isEngineeringOpen : undefined}
           aria-controls={!isDesktopEngineering ? engineeringDrawerId : undefined}
           aria-label="工程画像面板"
-          title="工程画像 (Ctrl+.)"
+          title="工程画像"
           className={cn(
             'relative inline-flex size-8 items-center justify-center rounded-lg border transition-colors cursor-pointer',
             isEngineeringOpen

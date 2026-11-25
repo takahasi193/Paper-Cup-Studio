@@ -120,7 +120,11 @@ function formatMetricsBadge(metrics: unknown): string {
 
 function describeSubagentActivity(task: SubagentTaskSummary): string {
   if (task.activityState === 'running_tool') return '执行工具中';
-  if (task.activityState === 'waiting_model') return '等待模型';
+  if (task.activityState === 'waiting_model') {
+    if (task.isThinking) return '思考中';
+    if (task.lastProgressSummary) return '生成中';
+    return '等待模型';
+  }
   if (task.activityState === 'aborted') return '已中止';
   if (task.activityState === 'unknown') return '状态未知';
   if (task.activityState === 'error') return '执行失败';
@@ -232,10 +236,16 @@ export function ToolCallBlock({
 
         <span className="flex shrink-0 items-center gap-2 text-[11px] text-ink-3">
           {linkedSubagentTask && (
-            <span className="hidden font-mono sm:inline">
-              {describeSubagentActivity(linkedSubagentTask)} · {linkedSubagentTask.toolCallCount} 次工具
-              {linkedSubagentTask.artifactsCount > 0 && (
-                <span className="text-ok"> · {linkedSubagentTask.artifactsCount} 产物</span>
+            <span className="hidden max-w-64 truncate font-mono sm:inline">
+              {linkedSubagentTask.role === 'translator' && linkedSubagentTask.lastProgressSummary ? (
+                linkedSubagentTask.lastProgressSummary
+              ) : (
+                <>
+                  {describeSubagentActivity(linkedSubagentTask)} · {linkedSubagentTask.toolCallCount} 次工具
+                  {linkedSubagentTask.artifactsCount > 0 && (
+                    <span className="text-ok"> · {linkedSubagentTask.artifactsCount} 产物</span>
+                  )}
+                </>
               )}
             </span>
           )}

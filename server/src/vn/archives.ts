@@ -7,6 +7,7 @@
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
@@ -17,7 +18,19 @@ import {
   isSymlinkPath,
   projectHarnessDir,
   realpathSafe,
+  resolvePathWithAncestors,
 } from './profile.js';
+import { resolveWorkspacePaths } from './workspace-paths.js';
+import {
+  assertSkillScriptVerified,
+  discoverSkillPackages,
+  findSkillPackageByEngine,
+  findSkillPackageByName,
+  hashSkillFile,
+  listRegistryEngineProfiles,
+  resolveSkillBindingFromRegistry,
+  type SkillTier,
+} from './skill-registry.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -55,7 +68,7 @@ const DRIVE_RE = /^[A-Za-z]:/;
 const RPA_LINE_RE = /^RPA-(2\.0|3\.0|3\.2) ([0-9A-Fa-f]{8,16})(?: ([0-9A-Fa-f]{8}))?(?:\r?\n|$)/;
 const XP3_MAGIC = Buffer.from([0x58, 0x50, 0x33, 0x0d, 0x0a, 0x20, 0x0a, 0x1a, 0x8b, 0x67, 0x01]);
 const DATA_DIR_RE = /^.+_data$/;
-const SKIP_DIRS = new Set([
+const ALWAYS_SKIP_DIRS = new Set([
   '.git',
   '.hg',
   '.svn',
@@ -64,6 +77,11 @@ const SKIP_DIRS = new Set([
   '__pycache__',
   '.venv',
   'venv',
+  'backup',
+  'backups',
+]);
+const TOP_ONLY_SKIP_DIRS = new Set([
+  'patch',
   'unpacked',
   'work',
   'build',
@@ -76,6 +94,7 @@ const CANDIDATE_SUFFIX = new Set([
   '.rpa', '.xp3', '.int', '.unity3d', '.bundle', '.assets', '.exe', '.wolf',
   '.pak', '.dat', '.bin', '.arc', '.pack', '.vol', '.cpk',
   '.nsa', '.sar', '.pfs', '.yks', '.ypf', '.pck', '.zip', '.7z', '.rar',
+  '.ain', '.ald', '.alm', '.gxp', '.vfs',
 ]);
 const RESERVED_CUSTOM_ENGINES = new Set(['renpy', 'kirikiri', 'nscripter']);
 
@@ -138,6 +157,17 @@ export function staysInside(root: string, name: string): string {
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new ArchiveError(`路径不合法：${name}`);
   }
+  if (root !== '.') {
+    const resolved = resolvePathWithAncestors(dest);
+    if (!resolved) {
+      throw new ArchiveError(`路径不合法：${name}`);
+    }
+    const realRel = path.relative(base, resolved);
+    if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+      throw new ArchiveError(`路径不合法：${name}`);
+    }
+    return resolved;
+  }
   return dest;
 }
 
@@ -187,6 +217,19 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
   const marks: number[] = [];
   const memo = new Map<string, unknown>();
 
+  const ensure = (n: number): void => {
+    if (!Number.isSafeInteger(n) || n < 0 || n > MAX_INDEX_BYTES || pos + n > buf.length) {
+      throw new ArchiveError('无法解析 RPA 索引 (truncated)');
+    }
+  };
+  const popStack = (): unknown => {
+    if (!stack.length) throw new ArchiveError('无法解析 RPA 索引 (stack underflow)');
+    return stack.pop();
+  };
+  const peekStack = (): unknown => {
+    if (!stack.length) throw new ArchiveError('无法解析 RPA 索引 (stack underflow)');
+    return stack[stack.length - 1];
+  };
   const popMark = (): unknown[] => {
     const idx = marks.pop();
     if (idx === undefined) throw new ArchiveError('无法解析 RPA 索引 (MARK underflow)');
@@ -219,9 +262,11 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
     }
     switch (op) {
       case 0x80: // PROTO
+        ensure(1);
         pos += 1;
         break;
       case 0x95: // FRAME (8 bytes uint64 len)
+        ensure(8);
         pos += 8;
         break;
       case 0x28: // '(' MARK
@@ -237,15 +282,15 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         stack.push([]);
         break;
       case 0x61: { // 'a' APPEND
-        const item = stack.pop();
-        const list = stack[stack.length - 1] as unknown[];
+        const item = popStack();
+        const list = peekStack() as unknown[];
         if (!Array.isArray(list)) throw new ArchiveError('无法解析 RPA 索引');
         list.push(item);
         break;
       }
       case 0x65: { // 'e' APPENDS
         const items = popMark();
-        const list = stack[stack.length - 1] as unknown[];
+        const list = peekStack() as unknown[];
         if (!Array.isArray(list)) throw new ArchiveError('无法解析 RPA 索引');
         list.push(...items);
         break;
@@ -257,20 +302,20 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         stack.push(popMark());
         break;
       case 0x85: { // TUPLE1
-        const a = stack.pop();
+        const a = popStack();
         stack.push([a]);
         break;
       }
       case 0x86: { // TUPLE2
-        const b = stack.pop();
-        const a = stack.pop();
+        const b = popStack();
+        const a = popStack();
         stack.push([a, b]);
         break;
       }
       case 0x87: { // TUPLE3
-        const c = stack.pop();
-        const b = stack.pop();
-        const a = stack.pop();
+        const c = popStack();
+        const b = popStack();
+        const a = popStack();
         stack.push([a, b, c]);
         break;
       }
@@ -284,16 +329,16 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         break;
       }
       case 0x73: { // 's' SETITEM
-        const val = stack.pop();
-        const key = stack.pop();
-        const dict = stack[stack.length - 1] as Record<string, unknown>;
+        const val = popStack();
+        const key = popStack();
+        const dict = peekStack() as Record<string, unknown>;
         if (!dict || typeof dict !== 'object') throw new ArchiveError('无法解析 RPA 索引');
         dict[key instanceof Buffer ? key.toString('utf8') : String(key)] = val;
         break;
       }
       case 0x75: { // 'u' SETITEMS
         const items = popMark();
-        const dict = stack[stack.length - 1] as Record<string, unknown>;
+        const dict = peekStack() as Record<string, unknown>;
         if (!dict || typeof dict !== 'object') throw new ArchiveError('无法解析 RPA 索引');
         for (let i = 0; i + 1 < items.length; i += 2) {
           const k = items[i];
@@ -302,57 +347,80 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         break;
       }
       case 0x4b: // 'K' BININT1
+        ensure(1);
         stack.push(buf[pos++]);
         break;
       case 0x4d: // 'M' BININT2
+        ensure(2);
         stack.push(buf.readUInt16LE(pos));
         pos += 2;
         break;
       case 0x4a: // 'J' BININT
+        ensure(4);
         stack.push(buf.readInt32LE(pos));
         pos += 4;
         break;
       case 0x49: { // 'I' INT
         const line = readLine();
-        stack.push(BigInt(line));
+        try {
+          stack.push(BigInt(line));
+        } catch {
+          throw new ArchiveError('无法解析 RPA 索引 (invalid INT)');
+        }
         break;
       }
       case 0x4c: { // 'L' LONG
         const line = readLine().replace(/L$/, '');
-        stack.push(BigInt(line));
+        try {
+          stack.push(BigInt(line));
+        } catch {
+          throw new ArchiveError('无法解析 RPA 索引 (invalid LONG)');
+        }
         break;
       }
       case 0x8a: { // LONG1
+        ensure(1);
         const n = buf[pos++];
+        ensure(n);
         const val = toSignedBigInt(buf.subarray(pos, pos + n));
         pos += n;
         stack.push(val);
         break;
       }
       case 0x8b: { // LONG4
+        ensure(4);
         const n = buf.readInt32LE(pos);
         pos += 4;
+        ensure(n);
         const val = toSignedBigInt(buf.subarray(pos, pos + n));
         pos += n;
         stack.push(val);
         break;
       }
       case 0x8c: { // SHORT_BINUNICODE
+        ensure(1);
         const n = buf[pos++];
+        ensure(n);
         stack.push(buf.subarray(pos, pos + n).toString('utf8'));
         pos += n;
         break;
       }
       case 0x58: { // 'X' BINUNICODE
+        ensure(4);
         const n = buf.readUInt32LE(pos);
         pos += 4;
+        ensure(n);
         stack.push(buf.subarray(pos, pos + n).toString('utf8'));
         pos += n;
         break;
       }
       case 0x8d: { // BINUNICODE8
-        const n = Number(buf.readBigUInt64LE(pos));
+        ensure(8);
+        const nBig = buf.readBigUInt64LE(pos);
         pos += 8;
+        if (nBig > BigInt(MAX_INDEX_BYTES)) throw new ArchiveError('无法解析 RPA 索引 (truncated)');
+        const n = Number(nBig);
+        ensure(n);
         stack.push(buf.subarray(pos, pos + n).toString('utf8'));
         pos += n;
         break;
@@ -361,57 +429,69 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         stack.push(readLine());
         break;
       case 0x43: { // 'C' SHORT_BINBYTES
+        ensure(1);
         const n = buf[pos++];
+        ensure(n);
         stack.push(Buffer.from(buf.subarray(pos, pos + n)));
         pos += n;
         break;
       }
       case 0x42: { // 'B' BINBYTES
+        ensure(4);
         const n = buf.readUInt32LE(pos);
         pos += 4;
+        ensure(n);
         stack.push(Buffer.from(buf.subarray(pos, pos + n)));
         pos += n;
         break;
       }
       case 0x55: { // 'U' SHORT_BINSTRING
+        ensure(1);
         const n = buf[pos++];
+        ensure(n);
         stack.push(buf.subarray(pos, pos + n).toString('latin1'));
         pos += n;
         break;
       }
       case 0x54: { // 'T' BINSTRING
+        ensure(4);
         const n = buf.readUInt32LE(pos);
         pos += 4;
+        ensure(n);
         stack.push(buf.subarray(pos, pos + n).toString('latin1'));
         pos += n;
         break;
       }
       case 0x71: { // 'q' BINPUT
+        ensure(1);
         const idx = String(buf[pos++]);
-        memo.set(idx, stack[stack.length - 1]);
+        memo.set(idx, peekStack());
         break;
       }
       case 0x72: { // 'r' LONG_BINPUT
+        ensure(4);
         const idx = String(buf.readUInt32LE(pos));
         pos += 4;
-        memo.set(idx, stack[stack.length - 1]);
+        memo.set(idx, peekStack());
         break;
       }
       case 0x70: { // 'p' PUT
         const idx = readLine();
-        memo.set(idx, stack[stack.length - 1]);
+        memo.set(idx, peekStack());
         break;
       }
       case 0x94: { // MEMOIZE
-        memo.set(String(memo.size), stack[stack.length - 1]);
+        memo.set(String(memo.size), peekStack());
         break;
       }
       case 0x68: { // 'h' BINGET
+        ensure(1);
         const idx = String(buf[pos++]);
         stack.push(memo.get(idx));
         break;
       }
       case 0x6a: { // 'j' LONG_BINGET
+        ensure(4);
         const idx = String(buf.readUInt32LE(pos));
         pos += 4;
         stack.push(memo.get(idx));
@@ -435,8 +515,8 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         break;
       }
       case 0x93: { // STACK_GLOBAL
-        const name = String(stack.pop());
-        const mod = String(stack.pop());
+        const name = String(popStack());
+        const mod = String(popStack());
         if (mod === '_codecs' && name === 'encode') {
           stack.push({ __fn: 'codecs_encode' });
         } else if ((mod === '__builtin__' || mod === 'builtins') && name === 'bytes') {
@@ -447,8 +527,8 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
         break;
       }
       case 0x52: { // 'R' REDUCE
-        const args = stack.pop() as unknown[];
-        const fn = stack.pop() as { __fn?: string };
+        const args = popStack() as unknown[];
+        const fn = popStack() as { __fn?: string };
         if (fn?.__fn === 'codecs_encode' && Array.isArray(args) && typeof args[0] === 'string') {
           const enc = String(args[1] ?? 'latin-1').toLowerCase().replace('_', '-');
           if (enc === 'utf-8' || enc === 'utf8') stack.push(Buffer.from(args[0], 'utf8'));
@@ -456,7 +536,10 @@ function decodePickle(buf: Buffer): Record<string, Array<[number, number, Buffer
           else throw new ArchiveError('refused codec');
         } else if (fn?.__fn === 'bytes' && Array.isArray(args)) {
           if (typeof args[0] === 'string') {
-            stack.push(Buffer.from(args[0], String(args[1] ?? 'utf8') as BufferEncoding));
+            const enc = String(args[1] ?? 'utf-8').toLowerCase().replace('_', '-');
+            if (enc === 'utf-8' || enc === 'utf8') stack.push(Buffer.from(args[0], 'utf8'));
+            else if (enc === 'latin-1' || enc === 'latin1') stack.push(Buffer.from(args[0], 'latin1'));
+            else throw new ArchiveError('refused codec');
           } else {
             stack.push(Buffer.alloc(0));
           }
@@ -905,6 +988,10 @@ export function repackXp3(sourceDir: string, destArchive: string): void {
   }
 
   const extra = String(manifest.version) === 'extra';
+  atomicWriteWithBackup(destArchive, buildXp3ArchiveBuffer(files, extra));
+}
+
+function buildXp3ArchiveBuffer(files: Array<[string, Buffer]>, extra: boolean): Buffer {
   const headerLen = extra ? 40 : 19;
   let cursor = headerLen;
   const payloads: Buffer[] = [];
@@ -962,7 +1049,17 @@ export function repackXp3(sourceDir: string, destArchive: string): void {
     XP3_MAGIC.copy(headerBuf, 0);
     headerBuf.writeBigUInt64LE(BigInt(cursor), 11);
   }
-  atomicWriteWithBackup(destArchive, Buffer.concat([headerBuf, ...payloads, indexMeta, indexPacked]));
+  return Buffer.concat([headerBuf, ...payloads, indexMeta, indexPacked]);
+}
+
+export function packDeltaXp3(
+  entries: Array<[string, Buffer]>,
+  destArchive: string,
+  options: { extra?: boolean } = {}
+): void {
+  const sorted = [...entries].sort(([a], [b]) => a.localeCompare(b));
+  fs.mkdirSync(path.dirname(destArchive), { recursive: true });
+  atomicWriteWithBackup(destArchive, buildXp3ArchiveBuffer(sorted, Boolean(options.extra)));
 }
 
 /* ========================= PE+ZIP ========================= */
@@ -1013,6 +1110,9 @@ function readZipEntryData(fd: number, zipOffset: number, entry: ZipCdEntry): Buf
   }
   if (data.length !== entry.uncompressedSize) {
     throw new ArchiveError(`解压体积不一致：${entry.name}`);
+  }
+  if ((zlib.crc32(data) >>> 0) !== (entry.crc >>> 0)) {
+    throw new ArchiveError(`ZIP 条目 CRC32 校验失败：${entry.name}`);
   }
   return data;
 }
@@ -1124,14 +1224,21 @@ export function inspectPeZip(archivePath: string): PeZipIndex {
 
     let engine = 'pe-zip';
     const names = new Set(entries.map((e) => e.name.toLowerCase()));
-    if ([...names].some((n) => n === 'tyrano/tyrano.js' || n.endsWith('/config.tjs'))) {
+    const hasTyranoDir = [...names].some((n) => n.startsWith('tyrano/'));
+    if (
+      names.has('tyrano/tyrano.js') ||
+      names.has('tyrano/libs.js') ||
+      (hasTyranoDir && [...names].some((n) => n.endsWith('/config.tjs')))
+    ) {
       engine = 'tyrano';
-    } else if (names.has('package.json')) {
+    } else if (hasTyranoDir && names.has('package.json')) {
       const pkg = entries.find((e) => e.name.toLowerCase() === 'package.json');
       if (pkg && pkg.uncompressedSize <= 1024 * 1024) {
         try {
           const pkgBuf = readZipEntryData(fd, foundEocd.zipOffset, pkg);
-          if (pkgBuf.includes('app://')) engine = 'tyrano';
+          if (pkgBuf.includes('app://') || pkgBuf.toString('utf8').toLowerCase().includes('tyrano')) {
+            engine = 'tyrano';
+          }
         } catch {
           // ignore
         }
@@ -1333,6 +1440,7 @@ export interface NsaEntry {
 export interface NsaIndex {
   baseOffset: number;
   entries: NsaEntry[];
+  hasNbz: boolean;
 }
 
 class NsaBitReader {
@@ -1400,7 +1508,7 @@ export function loadNsaIndex(archivePath: string): NsaIndex {
       entries.push({ name, nameBytes: rawName, compression, offset, packed, original });
     }
     if (pos !== blob.length) throw new ArchiveError('NSA 索引长度不一致');
-    return { baseOffset: base, entries };
+    return { baseOffset: base, entries, hasNbz: entries.some((e) => e.compression === 4) };
   } finally {
     fs.closeSync(fd);
   }
@@ -1637,6 +1745,7 @@ export interface EngineMatcher {
   extensions: string[];
   magicBytes: Buffer;
   magicOffset: number;
+  overrideBuiltin?: boolean;
 }
 
 export interface ArchiveHit {
@@ -1655,6 +1764,13 @@ export interface UnknownFile {
   reason: string;
 }
 
+export interface EngineFingerprintHint {
+  engine: string;
+  displayName: string;
+  confidence: 'high' | 'medium';
+  evidence: string[];
+}
+
 export interface ScanResult {
   hits: ArchiveHit[];
   unknown: UnknownFile[];
@@ -1662,9 +1778,196 @@ export interface ScanResult {
   engines: string[];
 }
 
+interface EngineFingerprintSpec {
+  engine: string;
+  displayName: string;
+  exeNames?: string[];
+  filePairs?: Array<[string, string]>;
+  fileNames?: string[];
+  magicHex?: Array<{ suffix?: string; prefixHex: string }>;
+  suffixes?: string[];
+}
+
+const KNOWN_ENGINE_FINGERPRINTS: EngineFingerprintSpec[] = [
+  {
+    engine: 'siglus',
+    displayName: 'SiglusEngine',
+    exeNames: ['siglusengine.exe'],
+    filePairs: [['scene.pck', 'gameexe.dat']],
+    fileNames: ['scene.pck'],
+  },
+  {
+    engine: 'reallive',
+    displayName: 'RealLive',
+    exeNames: ['reallive.exe'],
+    filePairs: [['seen.txt', 'gameexe.ini']],
+  },
+  {
+    engine: 'artemis',
+    displayName: 'Artemis Engine',
+    magicHex: [
+      { suffix: '.pfs', prefixHex: '706638' },
+      { suffix: '.pfs', prefixHex: '706636' },
+    ],
+  },
+  {
+    engine: 'bgi',
+    displayName: 'BGI / Ethornell',
+    exeNames: ['bgi.exe', 'bhvc.exe'],
+    magicHex: [
+      { suffix: '.arc', prefixHex: '5061636b' },
+      { suffix: '.arc', prefixHex: '42555249' },
+    ],
+  },
+  {
+    engine: 'majiro',
+    displayName: 'Majiro',
+    magicHex: [{ suffix: '.arc', prefixHex: '4d616a69' }],
+  },
+  {
+    engine: 'yuris',
+    displayName: 'YU-RIS',
+    magicHex: [{ suffix: '.ypf', prefixHex: '59504600' }],
+  },
+  {
+    engine: 'qlie',
+    displayName: 'QLIE',
+    magicHex: [{ suffix: '.pack', prefixHex: '46696c65' }],
+  },
+  {
+    engine: 'alicesoft',
+    displayName: 'AliceSoft System 4',
+    suffixes: ['.ain', '.ald'],
+  },
+];
+
+export function detectEngineFingerprintHints(scan: ScanResult): EngineFingerprintHint[] {
+  if (!scan.unknown.length) return [];
+  const hitEngines = new Set(scan.hits.map((h) => h.engine.trim().toLowerCase()).filter(Boolean));
+  const byDir = new Map<string, Map<string, UnknownFile>>();
+  for (const item of scan.unknown) {
+    const dir = path.posix.dirname(item.path);
+    let dirMap = byDir.get(dir);
+    if (!dirMap) {
+      dirMap = new Map();
+      byDir.set(dir, dirMap);
+    }
+    const baseLower = path.posix.basename(item.path).toLowerCase();
+    if (!dirMap.has(baseLower)) {
+      dirMap.set(baseLower, item);
+    }
+  }
+
+  const acc = new Map<string, { displayName: string; confidence: 'high' | 'medium'; evidence: string[] }>();
+  const record = (engine: string, displayName: string, confidence: 'high' | 'medium', ev: string) => {
+    let cur = acc.get(engine);
+    if (!cur) {
+      cur = { displayName, confidence, evidence: [] };
+      acc.set(engine, cur);
+    } else if (confidence === 'high') {
+      cur.confidence = 'high';
+    }
+    if (!cur.evidence.includes(ev)) {
+      cur.evidence.push(ev);
+    }
+  };
+
+  for (const spec of KNOWN_ENGINE_FINGERPRINTS) {
+    if (hitEngines.has(spec.engine)) continue;
+
+    let pairMatched = false;
+    if (spec.exeNames?.length) {
+      for (const item of scan.unknown) {
+        if (item.suffix.toLowerCase() !== '.exe') continue;
+        const baseLower = path.posix.basename(item.path).toLowerCase();
+        if (spec.exeNames.includes(baseLower)) {
+          record(spec.engine, spec.displayName, 'high', item.path);
+        }
+      }
+    }
+
+    if (spec.filePairs?.length) {
+      for (const [dir, dirMap] of byDir.entries()) {
+        for (const [aName, bName] of spec.filePairs) {
+          const aItem = dirMap.get(aName);
+          const bItem = dirMap.get(bName);
+          if (aItem && bItem) {
+            pairMatched = true;
+            const prefix = dir === '.' ? '' : `${dir}/`;
+            record(
+              spec.engine,
+              spec.displayName,
+              'high',
+              `${prefix}${path.posix.basename(aItem.path)} + ${path.posix.basename(bItem.path)}`
+            );
+          }
+        }
+      }
+    }
+
+    if (spec.magicHex?.length) {
+      for (const item of scan.unknown) {
+        const headLower = item.head.toLowerCase();
+        const suffixLower = item.suffix.toLowerCase();
+        if (!headLower) continue;
+        for (const rule of spec.magicHex) {
+          if (rule.suffix && suffixLower !== rule.suffix) continue;
+          if (headLower.startsWith(rule.prefixHex)) {
+            record(spec.engine, spec.displayName, 'high', `${item.path} (head=${item.head})`);
+            break;
+          }
+        }
+      }
+    }
+
+    if (spec.fileNames?.length && !pairMatched) {
+      for (const item of scan.unknown) {
+        const baseLower = path.posix.basename(item.path).toLowerCase();
+        if (spec.fileNames.includes(baseLower)) {
+          record(spec.engine, spec.displayName, 'medium', item.path);
+        }
+      }
+    }
+
+    if (spec.suffixes?.length) {
+      for (const item of scan.unknown) {
+        const suffixLower = item.suffix.toLowerCase();
+        if (!spec.suffixes.includes(suffixLower)) continue;
+        const dir = path.posix.dirname(item.path);
+        const dirMap = byDir.get(dir);
+        const distinctSuffixesInDir = new Set<string>();
+        if (dirMap) {
+          for (const sibling of dirMap.values()) {
+            const sibSuf = sibling.suffix.toLowerCase();
+            if (spec.suffixes.includes(sibSuf)) distinctSuffixesInDir.add(sibSuf);
+          }
+        }
+        const conf: 'high' | 'medium' = distinctSuffixesInDir.size >= 2 ? 'high' : 'medium';
+        record(spec.engine, spec.displayName, conf, item.path);
+      }
+    }
+  }
+
+  return Array.from(acc.entries())
+    .map(([engine, info]) => ({
+      engine,
+      displayName: info.displayName,
+      confidence: info.confidence,
+      evidence: info.evidence,
+    }))
+    .sort((a, b) => {
+      if (a.confidence !== b.confidence) return a.confidence === 'high' ? -1 : 1;
+      return a.engine.localeCompare(b.engine);
+    });
+}
+
 export interface SkillBinding {
   state: 'ready' | 'mismatch' | 'absent';
   directory?: string;
+  tier?: SkillTier;
+  skillName?: string;
+  overrideBuiltin?: boolean;
+  errors?: string[];
 }
 
 export function isEngineName(name: string): boolean {
@@ -1676,29 +1979,65 @@ export function globalEnginesDir(homeDir: string): string {
 }
 
 export function listGlobalEngines(homeDir: string | null): string[] {
-  if (!homeDir) return [];
-  const root = globalEnginesDir(homeDir);
-  if (isSymlinkPath(root) || !fs.existsSync(root) || !fs.statSync(root).isDirectory()) return [];
-  return fs
-    .readdirSync(root, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && !isSymlinkPath(path.join(root, d.name)) && isEngineName(d.name))
-    .map((d) => d.name)
-    .sort();
+  const names = new Set<string>();
+  if (homeDir) {
+    const root = globalEnginesDir(homeDir);
+    if (!isSymlinkPath(root) && fs.existsSync(root) && fs.statSync(root).isDirectory()) {
+      for (const d of fs.readdirSync(root, { withFileTypes: true })) {
+        if (d.isDirectory() && !isSymlinkPath(path.join(root, d.name)) && isEngineName(d.name)) {
+          names.add(d.name);
+        }
+      }
+    }
+  }
+  for (const entry of listRegistryEngineProfiles(null, { homeDir, workspaceSkillsDir: null })) {
+    if (isEngineName(entry.engine)) names.add(entry.engine);
+  }
+  return Array.from(names).sort();
 }
 
 export function loadEngineProfile(homeDir: string | null, name: string): Record<string, unknown> | null {
-  if (!homeDir || !isEngineName(name)) return null;
-  const p = path.join(globalEnginesDir(homeDir), name, 'engine.json');
-  try {
-    if (isSymlinkPath(p) || !fs.existsSync(p)) return null;
-    const st = fs.statSync(p);
-    if (!st.isFile() || st.size > 32 * 1024) return null;
-    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    return { name, ...(parsed as Record<string, unknown>) };
-  } catch {
-    return null;
+  const norm = name.trim().toLowerCase();
+  if (!norm || !isEngineName(norm)) return null;
+
+  // 1) Self-contained global skill (~/.papercup/skills/<skill>/engine.json)
+  if (homeDir) {
+    const globalPkg = findSkillPackageByEngine(norm, null, {
+      homeDir,
+      workspaceSkillsDir: null,
+      repoSkillsDir: null,
+    });
+    if (globalPkg?.engineJson) {
+      return { name: norm, ...globalPkg.engineJson };
+    }
+
+    // 2) Legacy global engine profile (~/.papercup/engines/<name>/engine.json)
+    const p = path.join(globalEnginesDir(homeDir), norm, 'engine.json');
+    try {
+      if (!isSymlinkPath(p) && fs.existsSync(p)) {
+        const st = fs.statSync(p);
+        if (st.isFile() && st.size <= 32 * 1024) {
+          const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return { name: norm, ...(parsed as Record<string, unknown>) };
+          }
+        }
+      }
+    } catch {
+      // ignore invalid legacy profile
+    }
   }
+
+  // 3) Self-contained repo built-in skill (<PaperCup>/skills/<skill>/engine.json)
+  const repoPkg = findSkillPackageByEngine(norm, null, {
+    homeDir: null,
+    workspaceSkillsDir: null,
+    globalSkillsDir: null,
+  });
+  if (repoPkg?.engineJson) {
+    return { name: norm, ...repoPkg.engineJson };
+  }
+  return null;
 }
 
 export function profileSkill(profile: Record<string, unknown> | null): string {
@@ -1721,6 +2060,7 @@ export function parseEngineMatcher(profile: Record<string, unknown> | null): Eng
   if (!name || !isEngineName(name) || RESERVED_CUSTOM_ENGINES.has(name)) return null;
   const pipeline = String(profile.pipeline || '').trim().toLowerCase();
   if (pipeline === 'builtin') return null;
+  const overrideBuiltin = profile.override_builtin === true;
   const rawMatch = profile.match;
   if (!rawMatch || typeof rawMatch !== 'object' || Array.isArray(rawMatch)) return null;
   const m = rawMatch as Record<string, unknown>;
@@ -1753,19 +2093,103 @@ export function parseEngineMatcher(profile: Record<string, unknown> | null): Eng
       }
     }
   }
-  if (BUILTIN_ARCHIVE_KINDS.has(kind) || NO_UNPACKER_KINDS.has(kind)) return null;
-  return { engine: name, kind, extensions, magicBytes, magicOffset: offset };
+  if (NO_UNPACKER_KINDS.has(kind)) return null;
+  if (BUILTIN_ARCHIVE_KINDS.has(kind) && !overrideBuiltin) return null;
+  return {
+    engine: name,
+    kind,
+    extensions,
+    magicBytes,
+    magicOffset: offset,
+    ...(overrideBuiltin ? { overrideBuiltin: true } : {}),
+  };
 }
 
-export function loadCustomMatchers(homeDir: string | null): EngineMatcher[] {
-  const names = listGlobalEngines(homeDir);
-  const found: EngineMatcher[] = [];
-  for (const name of names) {
-    const data = loadEngineProfile(homeDir, name);
-    const matcher = parseEngineMatcher(data);
-    if (matcher) found.push(matcher);
+export function loadProjectHarnessEngineJson(workspace: string, homeDir: string | null): Record<string, unknown> | null {
+  const projPath = path.join(projectHarnessDir(workspace, homeDir), 'engine.json');
+  try {
+    if (isSymlinkPath(projPath) || !fs.existsSync(projPath)) return null;
+    const st = fs.statSync(projPath);
+    if (!st.isFile() || st.size > 32 * 1024) return null;
+    const parsed = JSON.parse(fs.readFileSync(projPath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
   }
-  return found;
+}
+
+export function loadCustomMatchers(homeDir: string | null, workspace?: string | null): EngineMatcher[] {
+  const byEngine = new Map<string, EngineMatcher>();
+
+  // Lowest priority -> highest priority:
+  // 1) Repo built-in self-contained skills (<PaperCup>/skills/)
+  for (const entry of listRegistryEngineProfiles(null, { homeDir: null, workspaceSkillsDir: null, globalSkillsDir: null })) {
+    const matcher = parseEngineMatcher(entry.engineJson);
+    if (matcher && !matcher.overrideBuiltin) byEngine.set(matcher.engine, matcher);
+  }
+
+  // 2) Legacy global engines (~/.papercup/engines/)
+  if (homeDir) {
+    const legacyRoot = globalEnginesDir(homeDir);
+    if (!isSymlinkPath(legacyRoot) && fs.existsSync(legacyRoot) && fs.statSync(legacyRoot).isDirectory()) {
+      for (const d of fs.readdirSync(legacyRoot, { withFileTypes: true })) {
+        if (!d.isDirectory() || isSymlinkPath(path.join(legacyRoot, d.name)) || !isEngineName(d.name)) continue;
+        const p = path.join(legacyRoot, d.name, 'engine.json');
+        try {
+          if (isSymlinkPath(p) || !fs.existsSync(p)) continue;
+          const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const matcher = parseEngineMatcher({ name: d.name, ...(parsed as Record<string, unknown>) });
+            if (matcher && !matcher.overrideBuiltin) byEngine.set(matcher.engine, matcher);
+          }
+        } catch {
+          // ignore invalid legacy profile
+        }
+      }
+    }
+
+    // 3) Global self-contained skills (~/.papercup/skills/)
+    for (const entry of listRegistryEngineProfiles(null, { homeDir, workspaceSkillsDir: null, repoSkillsDir: null })) {
+      const matcher = parseEngineMatcher(entry.engineJson);
+      if (matcher && !matcher.overrideBuiltin) byEngine.set(matcher.engine, matcher);
+    }
+  }
+
+  // 4) Workspace project harness + workspace self-contained skills (<workspace>/.papercup/skills/)
+  // Project-level override_builtin matchers are only activated when the workspace skill passes integrity (`ready`).
+  if (workspace) {
+    const projData = loadProjectHarnessEngineJson(workspace, homeDir);
+    const isProjectOverrideReady = (eng: string, kind: string): boolean => {
+      const reg = resolveSkillBindingFromRegistry(workspace, eng, {
+        homeDir,
+        kind,
+        globalSkillsDir: null,
+        repoSkillsDir: null,
+        projectHarnessEngineJson: projData,
+      });
+      return reg.state === 'ready';
+    };
+
+    const projMatcher = parseEngineMatcher(projData);
+    if (projMatcher) {
+      if (!projMatcher.overrideBuiltin || isProjectOverrideReady(projMatcher.engine, projMatcher.kind)) {
+        byEngine.set(projMatcher.engine, projMatcher);
+      }
+    }
+    for (const pkg of discoverSkillPackages(workspace, { homeDir: null, globalSkillsDir: null, repoSkillsDir: null })) {
+      if (!pkg.engineJson) continue;
+      const matcher = parseEngineMatcher({ name: pkg.engine, ...pkg.engineJson });
+      if (matcher) {
+        if (!matcher.overrideBuiltin || isProjectOverrideReady(matcher.engine, matcher.kind)) {
+          byEngine.set(matcher.engine, matcher);
+        }
+      }
+    }
+  }
+
+  return Array.from(byEngine.values()).sort((a, b) => a.engine.localeCompare(b.engine));
 }
 
 function readAt(filePath: string, offset: number, count: number): Buffer | null {
@@ -1791,17 +2215,9 @@ function looksBinary(head: Buffer): boolean {
   return false;
 }
 
-function looksText(head: Buffer): boolean {
-  for (let i = 0; i < head.length; i++) {
-    const b = head[i];
-    if (!(b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127))) return false;
-  }
-  return true;
-}
-
 function unknownHead(head: Buffer): string {
   const sample = head.subarray(0, 4);
-  if (!sample.length || looksText(sample)) return '';
+  if (!sample.length) return '';
   return sample.toString('hex');
 }
 
@@ -1844,6 +2260,12 @@ function classifyFile(root: string, filePath: string, matchers: EngineMatcher[])
   }
   const rel = path.relative(root, filePath).replace(/\\/g, '/');
 
+  for (const rule of matchers) {
+    if (rule.overrideBuiltin && ruleMatchesFile(filePath, suffix, head, rule)) {
+      return { engine: rule.engine, path: rel, kind: rule.kind, version: '', extra: { override_builtin: 1 } };
+    }
+  }
+
   const rpa = parseRpaHeaderText(head, size);
   if (rpa && rpa.offset < size) {
     return { engine: 'renpy', path: rel, kind: 'rpa', version: rpa.version, extra: rpa };
@@ -1872,6 +2294,9 @@ function classifyFile(root: string, filePath: string, matchers: EngineMatcher[])
   if (suffix === '.nsa') {
     try {
       const idx = loadNsaIndex(filePath);
+      if (idx.hasNbz) {
+        return { path: rel, size, suffix, head: unknownHead(head), reason: 'unsupported nsa compression (nbz/bzip2)' };
+      }
       return { engine: 'nscripter', path: rel, kind: 'nsa', version: 'nsa', extra: { base_offset: idx.baseOffset } };
     } catch {
       return { path: rel, size, suffix, head: unknownHead(head), reason: 'malformed nsa header' };
@@ -1909,53 +2334,102 @@ function classifyFile(root: string, filePath: string, matchers: EngineMatcher[])
   return null;
 }
 
+function isPaperCupManagedTopDir(dirPath: string, lowerName: string, prioritySet: Set<string>): boolean {
+  if (lowerName === 'patch' || lowerName === 'unpacked' || lowerName === 'classify-src') return true;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch {
+    return true;
+  }
+  // If a top-level work/build/results/release dir directly contains game archives/exes, do not hide them
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    const ext = path.extname(ent.name).toLowerCase();
+    if (prioritySet.has(ext) || CANDIDATE_SUFFIX.has(ext)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function scanWorkspace(workspace: string, homeDir: string | null = null): ScanResult {
   const root = realpathSafe(workspace);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
     return { hits: [], unknown: [], unknownTotal: 0, engines: [] };
   }
-  const matchers = loadCustomMatchers(homeDir);
+  const matchers = loadCustomMatchers(homeDir, root);
   const customExts = new Set(matchers.flatMap((m) => m.extensions));
   const prioritySet = new Set([...PRIORITY_SUFFIX, ...customExts]);
+  const candidateSet = new Set([...CANDIDATE_SUFFIX, ...customExts]);
+  const hasExtensionlessCustomMatcher = matchers.some((m) => m.extensions.length === 0 && m.magicBytes.length > 0);
 
-  const files: string[] = [];
-  function walk(dir: string, depth: number) {
-    if (files.length >= MAX_SCAN_FILES || depth >= MAX_SCAN_DEPTH) return;
+  const priorityFiles: string[] = [];
+  const candidateFiles: string[] = [];
+  const fallbackFiles: string[] = [];
+  const MAX_WALK_DIRS = 512;
+  const MAX_WALK_ENTRIES = 20000;
+  let dirsWalked = 0;
+  let entriesWalked = 0;
+
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  while (queue.length > 0 && dirsWalked < MAX_WALK_DIRS && entriesWalked < MAX_WALK_ENTRIES) {
+    const { dir, depth } = queue.shift()!;
+    if (depth >= MAX_SCAN_DEPTH) continue;
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
-      return;
+      continue;
     }
+    dirsWalked++;
     const subDirs: string[] = [];
     const fileNames: string[] = [];
     for (const ent of entries) {
+      if (entriesWalked >= MAX_WALK_ENTRIES) break;
+      entriesWalked++;
       const full = path.join(dir, ent.name);
       if (isSymlinkPath(full)) continue;
       if (ent.isDirectory()) {
-        if (!ent.name.startsWith('.') && !SKIP_DIRS.has(ent.name.toLowerCase())) {
-          subDirs.push(ent.name);
+        if (ent.name.startsWith('.')) continue;
+        const low = ent.name.toLowerCase();
+        if (ALWAYS_SKIP_DIRS.has(low)) continue;
+        if (depth === 0 && TOP_ONLY_SKIP_DIRS.has(low) && isPaperCupManagedTopDir(full, low, prioritySet)) {
+          continue;
         }
+        subDirs.push(ent.name);
       } else if (ent.isFile() && path.extname(ent.name).toLowerCase() !== '.bak') {
         fileNames.push(ent.name);
       }
     }
-    fileNames.sort((a, b) => {
-      const pa = prioritySet.has(path.extname(a).toLowerCase()) ? 0 : 1;
-      const pb = prioritySet.has(path.extname(b).toLowerCase()) ? 0 : 1;
-      return pa !== pb ? pa - pb : a.localeCompare(b);
-    });
+
+    fileNames.sort((a, b) => a.localeCompare(b));
+    const parentLower = path.basename(dir).toLowerCase();
     for (const name of fileNames) {
-      if (files.length >= MAX_SCAN_FILES) return;
-      files.push(path.join(dir, name));
+      const full = path.join(dir, name);
+      const ext = path.extname(name).toLowerCase();
+      const baseLow = name.toLowerCase();
+      const isUnityLayoutFile =
+        DATA_DIR_RE.test(parentLower) &&
+        (baseLow === 'resources.assets' ||
+          baseLow === 'globalgamemanagers' ||
+          (baseLow.startsWith('sharedassets') && baseLow.endsWith('.assets')));
+      if (prioritySet.has(ext) || baseLow === 'nscript.dat' || isUnityLayoutFile) {
+        if (priorityFiles.length < MAX_SCAN_FILES) priorityFiles.push(full);
+      } else if (candidateSet.has(ext) || ext === '') {
+        if (candidateFiles.length < MAX_SCAN_FILES) candidateFiles.push(full);
+      } else if (hasExtensionlessCustomMatcher && fallbackFiles.length < MAX_SCAN_FILES) {
+        fallbackFiles.push(full);
+      }
     }
-    subDirs.sort();
+
+    subDirs.sort((a, b) => a.localeCompare(b));
     for (const sub of subDirs) {
-      if (files.length >= MAX_SCAN_FILES) return;
-      walk(path.join(dir, sub), depth + 1);
+      queue.push({ dir: path.join(dir, sub), depth: depth + 1 });
     }
   }
-  walk(root, 0);
+
+  const files = [...priorityFiles, ...candidateFiles, ...fallbackFiles].slice(0, MAX_SCAN_FILES);
 
   const hits: ArchiveHit[] = [];
   let unknown: UnknownFile[] = [];
@@ -2005,10 +2479,13 @@ export function scanWorkspace(workspace: string, homeDir: string | null = null):
       }
     }
     for (const ent of entries) {
-      if (ent.isDirectory() && !ent.name.startsWith('.') && !SKIP_DIRS.has(ent.name.toLowerCase())) {
-        const sub = path.join(dir, ent.name);
-        if (!isSymlinkPath(sub)) walkLayout(sub, depth + 1);
-      }
+      if (!ent.isDirectory() || ent.name.startsWith('.')) continue;
+      const low = ent.name.toLowerCase();
+      if (ALWAYS_SKIP_DIRS.has(low)) continue;
+      const sub = path.join(dir, ent.name);
+      if (isSymlinkPath(sub)) continue;
+      if (depth === 0 && TOP_ONLY_SKIP_DIRS.has(low) && isPaperCupManagedTopDir(sub, low, prioritySet)) continue;
+      walkLayout(sub, depth + 1);
     }
   }
   walkLayout(root, 0);
@@ -2050,6 +2527,14 @@ export function selfCheckArchive(
     }
   }
 
+  if (matcher && (matcher.overrideBuiltin || !BUILTIN_ARCHIVE_KINDS.has(current.kind))) {
+    const head = readAt(archivePath, 0, 64) || Buffer.alloc(0);
+    if (!ruleMatchesFile(archivePath, path.extname(archivePath).toLowerCase(), head, matcher)) {
+      return { ok: false, reason: 'custom match mismatch' };
+    }
+    return { ok: true, reason: 'custom match ok' };
+  }
+
   if (current.kind === 'rpa') {
     try {
       loadRpaIndex(archivePath, Number(current.extra.offset), Number(current.extra.key || 0));
@@ -2068,7 +2553,10 @@ export function selfCheckArchive(
   }
   if (current.kind === 'pe-zip') {
     try {
-      inspectPeZip(archivePath);
+      const idx = inspectPeZip(archivePath);
+      if (idx.entries.some((e) => !e.isDir && (e.flagBits & 1) !== 0)) {
+        return { ok: false, reason: 'pe-zip contains encrypted entries' };
+      }
       return { ok: true, reason: 'pe-zip index ok' };
     } catch {
       return { ok: false, reason: 'pe-zip index' };
@@ -2076,20 +2564,125 @@ export function selfCheckArchive(
   }
   if (current.kind === 'nsa') {
     try {
-      loadNsaIndex(archivePath);
+      const idx = loadNsaIndex(archivePath);
+      if (idx.hasNbz) return { ok: false, reason: 'nsa contains unsupported nbz entries' };
       return { ok: true, reason: 'nsa index ok' };
     } catch {
       return { ok: false, reason: 'nsa index' };
     }
   }
-  if (matcher && !BUILTIN_ARCHIVE_KINDS.has(current.kind)) {
-    const head = readAt(archivePath, 0, 64) || Buffer.alloc(0);
-    if (!ruleMatchesFile(archivePath, path.extname(archivePath).toLowerCase(), head, matcher)) {
-      return { ok: false, reason: 'custom match mismatch' };
-    }
-    return { ok: true, reason: 'custom match ok' };
-  }
   return { ok: true, reason: 'magic' };
+}
+
+export function testBuiltinArchiveUnpackable(
+  archivePath: string,
+  hit?: ArchiveHit | null
+): { isBuiltinFormat: boolean; builtinKind?: string; canUnpack: boolean; reason: string } {
+  if (isSymlinkPath(archivePath) || !fs.existsSync(archivePath) || !fs.statSync(archivePath).isFile()) {
+    return { isBuiltinFormat: false, canUnpack: false, reason: 'missing archive' };
+  }
+  const st = fs.statSync(archivePath);
+  const head = readAt(archivePath, 0, 64) || Buffer.alloc(0);
+  const suffix = path.extname(archivePath).toLowerCase();
+
+  let builtinKind = hit && BUILTIN_ARCHIVE_KINDS.has(hit.kind) ? hit.kind : '';
+  let builtinHit: ArchiveHit | null =
+    hit && BUILTIN_ARCHIVE_KINDS.has(hit.kind) && hit.extra?.override_builtin !== 1 ? hit : null;
+
+  if (!builtinHit) {
+    const rpa = parseRpaHeaderText(head, st.size);
+    if (rpa && rpa.offset < st.size) {
+      builtinKind = 'rpa';
+      builtinHit = { engine: 'renpy', path: path.basename(archivePath), kind: 'rpa', version: rpa.version, extra: rpa };
+    } else if (head.subarray(0, 4).toString('ascii') === 'RPA-') {
+      return { isBuiltinFormat: true, builtinKind: 'rpa', canUnpack: false, reason: 'malformed rpa header' };
+    } else {
+      const xp3 = parseXp3Header(head, st.size);
+      if (xp3 && xp3.indexOffset >= 19 && xp3.indexOffset < st.size) {
+        builtinKind = 'xp3';
+        builtinHit = {
+          engine: 'kirikiri',
+          path: path.basename(archivePath),
+          kind: 'xp3',
+          version: xp3.version,
+          extra: { index_offset: xp3.indexOffset },
+        };
+      } else if (head.subarray(0, 3).toString('ascii') === 'XP3') {
+        return { isBuiltinFormat: true, builtinKind: 'xp3', canUnpack: false, reason: 'malformed xp3 header' };
+      } else if (suffix === '.exe' && head.subarray(0, 2).toString('ascii') === 'MZ') {
+        try {
+          const idx = inspectPeZip(archivePath);
+          builtinKind = 'pe-zip';
+          builtinHit = {
+            engine: idx.engine,
+            path: path.basename(archivePath),
+            kind: 'pe-zip',
+            version: '',
+            extra: { zip_offset: idx.zipOffset },
+          };
+        } catch {
+          // Regular PE executable without appended ZIP archive
+        }
+      } else if (suffix === '.nsa') {
+        builtinKind = 'nsa';
+        try {
+          const idx = loadNsaIndex(archivePath);
+          if (idx.hasNbz) {
+            return {
+              isBuiltinFormat: true,
+              builtinKind: 'nsa',
+              canUnpack: false,
+              reason: 'unsupported nsa compression (nbz/bzip2)',
+            };
+          }
+          builtinHit = {
+            engine: 'nscripter',
+            path: path.basename(archivePath),
+            kind: 'nsa',
+            version: 'nsa',
+            extra: { base_offset: idx.baseOffset },
+          };
+        } catch (err) {
+          return {
+            isBuiltinFormat: true,
+            builtinKind: 'nsa',
+            canUnpack: false,
+            reason: (err as Error).message || 'malformed nsa header',
+          };
+        }
+      }
+    }
+  }
+
+  if (!builtinKind || !builtinHit) {
+    return { isBuiltinFormat: false, canUnpack: false, reason: 'not builtin' };
+  }
+
+  const chk = selfCheckArchive(archivePath, builtinHit);
+  if (!chk.ok) {
+    return { isBuiltinFormat: true, builtinKind, canUnpack: false, reason: chk.reason };
+  }
+
+  if (st.size <= MAX_INDEX_BYTES) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'papercup-builtin-chk-'));
+    try {
+      if (builtinKind === 'rpa') unpackRpa(archivePath, tmpDir);
+      else if (builtinKind === 'xp3') unpackXp3(archivePath, tmpDir);
+      else if (builtinKind === 'pe-zip') unpackPeZip(archivePath, tmpDir);
+      else if (builtinKind === 'nsa') unpackNsa(archivePath, tmpDir);
+    } catch (err) {
+      return {
+        isBuiltinFormat: true,
+        builtinKind,
+        canUnpack: false,
+        reason: (err as Error).message || 'builtin unpack failed',
+      };
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  return { isBuiltinFormat: true, builtinKind, canUnpack: true, reason: chk.reason };
 }
 
 export interface LibraryHit {
@@ -2133,7 +2726,10 @@ export function matchLibrary(workspace: string, homeDir: string, scan?: ScanResu
 }
 
 export function findSkillDir(workspace: string, homeDir: string | null, skillName: string): string | null {
-  const candidates = [path.join(workspace, '.papercup', 'skills', skillName)];
+  const pkg = findSkillPackageByName(skillName, workspace, { homeDir });
+  if (pkg) return pkg.directory;
+  // Fallback for legacy non-self-contained global skill dirs (SKILL.md without co-located engine.json)
+  const candidates = [resolveWorkspacePaths(workspace).skillDir(skillName)];
   if (homeDir) candidates.push(path.join(homeDir, 'skills', skillName));
   for (const dir of candidates) {
     if (!isSymlinkPath(dir) && fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
@@ -2149,13 +2745,33 @@ export function findSkillDir(workspace: string, homeDir: string | null, skillNam
 export function skillBinding(workspace: string, homeDir: string | null, engine: string, kind = ''): SkillBinding {
   const norm = engine.trim().toLowerCase();
   if (!norm || !isEngineName(norm)) return { state: 'absent' };
-  const profile = resolveEngineJson(workspace, norm, homeDir) ?? (homeDir ? loadEngineProfile(homeDir, norm) : null);
+
+  const projectHarness = loadProjectHarnessEngineJson(workspace, homeDir);
+  const reg = resolveSkillBindingFromRegistry(workspace, norm, {
+    homeDir,
+    kind,
+    projectHarnessEngineJson: projectHarness,
+  });
+  if (reg.state === 'ready' || reg.state === 'mismatch') {
+    return {
+      state: reg.state,
+      ...(reg.directory ? { directory: reg.directory } : {}),
+      ...(reg.tier ? { tier: reg.tier } : {}),
+      ...(reg.skillName ? { skillName: reg.skillName } : {}),
+      ...(reg.overrideBuiltin ? { overrideBuiltin: true } : {}),
+      ...(reg.errors?.length ? { errors: reg.errors } : {}),
+    };
+  }
+
+  // Legacy split fallback: engine.json in ~/.papercup/engines/<name>/ + SKILL.md in ~/.papercup/skills/<skillName>/
+  const profile = resolveEngineJson(workspace, norm, homeDir) ?? loadEngineProfile(homeDir, norm);
   if (!profile) return { state: 'absent' };
   const pipeline = String(profile.pipeline || '').trim().toLowerCase();
   const isUnpackSkill = pipeline === 'skill';
+  const isDirectSkill = pipeline === 'direct';
   const isBuiltinAnalysisSkill =
     pipeline === 'builtin' && typeof profile[SKILL_POINTER] === 'string' && Boolean(String(profile[SKILL_POINTER]).trim());
-  if (!isUnpackSkill && !isBuiltinAnalysisSkill) {
+  if (!isUnpackSkill && !isDirectSkill && !isBuiltinAnalysisSkill) {
     return { state: 'absent' };
   }
   const kinds = Array.isArray(profile.kinds) ? profile.kinds.map(String) : [];
@@ -2168,22 +2784,26 @@ export function skillBinding(workspace: string, homeDir: string | null, engine: 
   const repackSha = typeof profile[REPACK_DIGEST] === 'string' ? profile[REPACK_DIGEST].trim().toLowerCase() : '';
   const extractSha = typeof profile[EXTRACT_DIGEST] === 'string' ? profile[EXTRACT_DIGEST].trim().toLowerCase() : '';
   const applySha = typeof profile[APPLY_DIGEST] === 'string' ? profile[APPLY_DIGEST].trim().toLowerCase() : '';
-  if (!skillName || !digest || (isUnpackSkill && (!unpackSha || !repackSha))) {
-    return { state: 'mismatch' };
+  if (!skillName || !digest || (isUnpackSkill && (!unpackSha || !repackSha)) || (isDirectSkill && (!extractSha || !applySha))) {
+    return { state: 'mismatch', skillName };
   }
   const dir = findSkillDir(workspace, homeDir, skillName);
-  if (!dir) return { state: 'mismatch' };
+  if (!dir) return { state: 'mismatch', skillName };
   try {
     const ok =
-      sha256Hex(fs.readFileSync(path.join(dir, 'SKILL.md'))) === digest &&
+      hashSkillFile(path.join(dir, 'SKILL.md')) === digest &&
       (!isUnpackSkill ||
-        (sha256Hex(fs.readFileSync(path.join(dir, 'unpack.py'))) === unpackSha &&
-          sha256Hex(fs.readFileSync(path.join(dir, 'repack.py'))) === repackSha)) &&
-      (!extractSha || sha256Hex(fs.readFileSync(path.join(dir, 'extract.py'))) === extractSha) &&
-      (!applySha || sha256Hex(fs.readFileSync(path.join(dir, 'apply.py'))) === applySha);
-    return ok ? { state: 'ready', directory: dir } : { state: 'mismatch' };
+        (hashSkillFile(path.join(dir, 'unpack.py')) === unpackSha &&
+          hashSkillFile(path.join(dir, 'repack.py')) === repackSha)) &&
+      (!extractSha || hashSkillFile(path.join(dir, 'extract.py')) === extractSha) &&
+      (!applySha || hashSkillFile(path.join(dir, 'apply.py')) === applySha) &&
+      (!fs.existsSync(path.join(dir, 'unpack.py')) || Boolean(unpackSha)) &&
+      (!fs.existsSync(path.join(dir, 'repack.py')) || Boolean(repackSha)) &&
+      (!fs.existsSync(path.join(dir, 'extract.py')) || Boolean(extractSha)) &&
+      (!fs.existsSync(path.join(dir, 'apply.py')) || Boolean(applySha));
+    return ok ? { state: 'ready', directory: dir, skillName } : { state: 'mismatch', directory: dir, skillName };
   } catch {
-    return { state: 'mismatch' };
+    return { state: 'mismatch', directory: dir, skillName };
   }
 }
 
@@ -2195,6 +2815,18 @@ export function resolveEngineJson(workspace: string, engine: string, homeDir: st
   if (norm && BUILTIN_ENGINE_JSON[norm]) {
     merged = { ...BUILTIN_ENGINE_JSON[norm] };
   }
+  // 1) Repo built-in self-contained skill (<PaperCup>/skills/)
+  if (norm && isEngineName(norm)) {
+    const repoPkg = findSkillPackageByEngine(norm, null, {
+      homeDir: null,
+      workspaceSkillsDir: null,
+      globalSkillsDir: null,
+    });
+    if (repoPkg?.engineJson) {
+      merged = { name: norm, ...repoPkg.engineJson };
+    }
+  }
+  // 2) Legacy global engine profile (~/.papercup/engines/)
   if (norm && homeDir) {
     const globalPath = path.join(globalEnginesDir(homeDir), norm, 'engine.json');
     if (!isSymlinkPath(globalPath) && fs.existsSync(globalPath)) {
@@ -2207,19 +2839,33 @@ export function resolveEngineJson(workspace: string, engine: string, homeDir: st
         // ignore invalid global
       }
     }
+    // 3) Global self-contained skill (~/.papercup/skills/)
+    const globalPkg = findSkillPackageByEngine(norm, null, {
+      homeDir,
+      workspaceSkillsDir: null,
+      repoSkillsDir: null,
+    });
+    if (globalPkg?.engineJson) {
+      merged = { name: norm, ...globalPkg.engineJson };
+    }
   }
-  const projPath = path.join(projectHarnessDir(workspace, homeDir), 'engine.json');
-  if (!isSymlinkPath(projPath) && fs.existsSync(projPath)) {
-    try {
-      const p = JSON.parse(fs.readFileSync(projPath, 'utf8'));
-      if (p && typeof p === 'object' && !Array.isArray(p)) {
-        const projEngine = typeof p.name === 'string' ? p.name.trim().toLowerCase() : '';
-        if (!norm || !projEngine || projEngine === norm) {
-          merged = p as Record<string, unknown>;
-        }
-      }
-    } catch {
-      // ignore invalid project
+  // 4) Workspace project harness engine.json
+  const p = loadProjectHarnessEngineJson(workspace, homeDir);
+  if (p) {
+    const projEngine = typeof p.name === 'string' ? p.name.trim().toLowerCase() : '';
+    if (!norm || !projEngine || projEngine === norm) {
+      merged = p;
+    }
+  }
+  // 5) Workspace self-contained skill (<workspace>/.papercup/skills/<skill>/engine.json)
+  if (norm && isEngineName(norm)) {
+    const wsPkg = findSkillPackageByEngine(norm, workspace, {
+      homeDir: null,
+      globalSkillsDir: null,
+      repoSkillsDir: null,
+    });
+    if (wsPkg?.engineJson) {
+      merged = { name: norm, ...wsPkg.engineJson };
     }
   }
   return merged;
@@ -2296,7 +2942,7 @@ export function commitHarness(root: string, updates: Record<string, string>, not
   return { versionId, digest, note: cleanNote };
 }
 
-function buildSanitizedEnv(): Record<string, string> {
+function buildSanitizedEnv(extraEnv?: Record<string, string>): Record<string, string> {
   const allowKeys = [
     'PATH',
     'Path',
@@ -2316,7 +2962,32 @@ function buildSanitizedEnv(): Record<string, string> {
   for (const k of allowKeys) {
     if (process.env[k]) env[k] = process.env[k]!;
   }
+  if (extraEnv) {
+    for (const [k, v] of Object.entries(extraEnv)) {
+      if (k && typeof v === 'string' && v.trim()) {
+        env[k] = v.trim();
+      }
+    }
+  }
   return env;
+}
+
+export function formatPythonErrorDetail(raw: string, maxChars = 600): string {
+  const cleaned = String(raw || '').trim().replace(/\s+/g, ' ');
+  if (!cleaned || maxChars <= 0) return '';
+  if (cleaned.length <= maxChars) return cleaned;
+  const sep = ' ... ';
+  if (maxChars >= 585) {
+    const headLen = 100;
+    const tailLen = maxChars === 600 ? 480 : Math.max(480, maxChars - headLen - sep.length);
+    return `${cleaned.slice(0, headLen)}${sep}${cleaned.slice(-tailLen)}`;
+  }
+  if (maxChars <= sep.length + 10) {
+    return cleaned.slice(-maxChars);
+  }
+  const headLen = Math.max(1, Math.min(100, Math.floor((maxChars - sep.length) / 5)));
+  const tailLen = maxChars - headLen - sep.length;
+  return `${cleaned.slice(0, headLen)}${sep}${cleaned.slice(-tailLen)}`;
 }
 
 export async function runPythonScript(
@@ -2324,7 +2995,8 @@ export async function runPythonScript(
   args: string[],
   cwd: string,
   timeoutMs = SCRIPT_TIMEOUT_MS,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  extraEnv?: Record<string, string>
 ): Promise<void> {
   if (isSymlinkPath(scriptPath) || !fs.existsSync(scriptPath) || !fs.statSync(scriptPath).isFile()) {
     throw new ArchiveError('脚本不存在或是符号链接');
@@ -2338,11 +3010,16 @@ export async function runPythonScript(
     throw new ArchiveError('脚本工作目录不存在');
   }
   try {
+    assertSkillScriptVerified(resolved);
+  } catch (err) {
+    throw new ArchiveError((err as Error).message);
+  }
+  try {
     await execFileAsync(config.pythonPath, ['-I', resolved, ...args.map(String)], {
       cwd,
       timeout: timeoutMs,
       signal,
-      env: buildSanitizedEnv(),
+      env: buildSanitizedEnv(extraEnv),
       windowsHide: true,
       maxBuffer: 1024 * 1024,
     });
@@ -2351,7 +3028,8 @@ export async function runPythonScript(
     if (e.killed) {
       throw new ArchiveError(`脚本超时（超过 ${timeoutMs / 1000} 秒）：${path.basename(resolved)}`);
     }
-    const detail = ((e.stderr || e.stdout || e.message || '') as string).trim().replace(/\s+/g, ' ').slice(0, 240);
+    const rawDetail = (e.stderr?.trim() ? e.stderr : e.stdout?.trim() ? e.stdout : e.message) || '';
+    const detail = formatPythonErrorDetail(String(rawDetail));
     throw new ArchiveError(`脚本失败（${path.basename(resolved)}，退出码 ${e.code ?? 1}）${detail ? '：' + detail : ''}`);
   }
 }
@@ -2361,23 +3039,24 @@ export function findUnpackManifests(sourceOrWorkspace: string): string[] {
   const found: string[] = [];
   const root = realpathSafe(sourceOrWorkspace);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return found;
-  function walk(dir: string) {
+  function walk(dir: string, depth: number) {
     for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, ent.name);
       if (isSymlinkPath(full)) continue;
       if (ent.isDirectory()) {
         if (ent.name === '.git' || ent.name === '.papercup' || ent.name === 'node_modules') continue;
-        walk(full);
+        if (depth === 0 && ent.name.toLowerCase() === 'patch') continue;
+        walk(full, depth + 1);
       } else if (ent.isFile() && names.has(ent.name)) {
         found.push(full);
       }
     }
   }
-  const unpackedDir = path.join(root, 'unpacked');
+  const unpackedDir = resolveWorkspacePaths(root).unpackedDir;
   if (fs.existsSync(unpackedDir) && fs.statSync(unpackedDir).isDirectory()) {
-    walk(unpackedDir);
+    walk(unpackedDir, 0);
   }
-  if (found.length === 0) walk(root);
+  if (found.length === 0) walk(root, 0);
   return found.sort();
 }
 

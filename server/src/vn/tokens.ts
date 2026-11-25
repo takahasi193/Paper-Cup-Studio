@@ -28,27 +28,21 @@ export const MODEL_FAMILIES: Record<string, ModelWeights> = {
   generic: { cjk: 1.2, kana: 1.25, latin: 0.28, digit: 0.35, space: 0.15, punct: 0.7, other: 1.25, overhead: 10 },
 };
 
-const FAMILY_ALIASES: Array<[string, string]> = [
-  ['qwen', 'qwen'],
-  ['dashscope', 'qwen'],
-  ['deepseek', 'deepseek'],
-  ['gemini', 'gemini'],
-  ['google', 'gemini'],
-  ['claude', 'claude'],
-  ['anthropic', 'claude'],
-  ['gpt', 'openai'],
-  ['openai', 'openai'],
-  ['o1', 'openai'],
-  ['o3', 'openai'],
-  ['o4', 'openai'],
-  ['glm', 'glm'],
-  ['zhipu', 'glm'],
-  ['kimi', 'kimi'],
-  ['moonshot', 'kimi'],
-  ['minimax', 'minimax'],
-  ['abab', 'minimax'],
-  ['step', 'step'],
-  ['doubao', 'doubao'],
+const FAMILY_ALIAS_PATTERNS: Array<[RegExp, string]> = [
+  [/qwen/i, 'qwen'],
+  [/dashscope/i, 'qwen'],
+  [/deepseek/i, 'deepseek'],
+  [/gemini/i, 'gemini'],
+  [/claude/i, 'claude'],
+  [/anthropic/i, 'claude'],
+  [/(?:^|[-_./:])(?:gpt|openai|chatgpt)(?:$|[-_./:\d])/i, 'openai'],
+  [/(?:^|[-_./:])o[134](?:$|[-_./:])/i, 'openai'],
+  [/(?:^|[-_./:])(?:glm|chatglm|zhipu)(?:$|[-_./:\d])/i, 'glm'],
+  [/(?:^|[-_./:])(?:kimi|moonshot)(?:$|[-_./:\d])/i, 'kimi'],
+  [/(?:^|[-_./:])(?:minimax|abab)(?:$|[-_./:\d])/i, 'minimax'],
+  [/(?:^|[-_./:])step(?:$|[-_./:\d])/i, 'step'],
+  [/doubao/i, 'doubao'],
+  [/(?:^|[-_./:])google(?:$|[-_./:])/i, 'gemini'],
 ];
 
 const ASCII_PUNCT = new Set(Array.from("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"));
@@ -68,9 +62,18 @@ export function detectModelFamily(model = ''): string {
   const raw = model.trim().toLowerCase();
   if (!raw) return 'generic';
   const norm = raw.includes('/') ? (raw.split('/').pop() ?? raw) : raw;
-  for (const [needle, family] of FAMILY_ALIASES) {
-    if (norm.includes(needle) || raw.includes(needle)) {
+  // Pass 1: match model name itself first so gateway/provider prefixes (e.g. magpie/google/claude-sonnet) never override the actual model family
+  for (const [pattern, family] of FAMILY_ALIAS_PATTERNS) {
+    if (pattern.test(norm)) {
       return family;
+    }
+  }
+  // Pass 2: fall back to full path / provider prefix when basename is generic
+  if (norm !== raw) {
+    for (const [pattern, family] of FAMILY_ALIAS_PATTERNS) {
+      if (pattern.test(raw)) {
+        return family;
+      }
     }
   }
   return 'generic';
@@ -118,7 +121,8 @@ export function estimateRecordTokens(record: Record<string, unknown>, family = '
 
 export function estimateWithMargin(tokens: number, marginRatio = 0.1): number {
   if (tokens <= 0) return 0;
-  return Math.ceil(tokens * (1.0 + Math.max(0.0, marginRatio)));
+  const scaled = Number((tokens * (1.0 + Math.max(0.0, marginRatio))).toFixed(9));
+  return Math.ceil(scaled);
 }
 
 export function estimateRecordsStats(records: Array<Record<string, unknown>>, family = 'generic'): {
